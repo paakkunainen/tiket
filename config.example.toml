@@ -1,0 +1,59 @@
+# Copy to ~/.config/tiket/config.toml (or set TIKET_CONFIG). Secrets come from .env
+# next to this file or ~/.config/tiket/.env, referenced as ${VAR}.
+
+[ollama]
+url = "http://localhost:11434"
+model = "gpt-oss:20b"
+language = "auto"     # "auto" = same language as existing tickets, or e.g. "Finnish"
+think = "medium"         # gpt-oss reasoning effort: low / medium / high
+examples = 12          # how many recent tickets to fetch as style examples
+
+[sites.businessfinland]
+kind = "jira_cloud"
+url = "https://businessfinland.atlassian.net"
+email = "you@example.com"
+token = "${JIRA_BUSINESSFINLAND}"
+
+[sites.digifinland]
+kind = "jira_cloud"
+url = "https://digifinland.atlassian.net"
+email = "you@example.com"
+token = "${JIRA_DIGIFINLAND}"
+
+[sites.eduuni]
+kind = "jira_dc"      # self-hosted Jira: personal access token, Bearer auth
+url = "https://jira.eduuni.fi"
+token = "${JIRA_EDUUNI}"
+
+[sites.esko]
+kind = "azure_devops"
+url = "https://dev.azure.com/EskoSystemsOy"
+token = "${DEVOPS_API_KEY}"
+
+# One entry per board. Find keys with: tiket projects <site>
+[projects.bf]
+site = "businessfinland"
+project = "KEY"
+default_type = "Task"
+
+[projects.dig]
+site = "digifinland"
+project = "KEY"
+default_type = "Task"
+
+[projects.edu]
+site = "eduuni"
+project = "KEY"
+default_type = "Task"
+
+[projects.esko]
+site = "esko"
+project = "Esko"
+default_type = "Task"
+# Optional per project:
+# types = ["Task", "Bug"]          # issue types the model may pick (default: default_type + types seen in recent tickets)
+# language = "Finnish"            # override [ollama].language for this project
+# style_notes = "Titles in Finnish, always add acceptance criteria"
+# assign_to_me = true
+# extra_fields = { labels = ["frontend"] }                         # Jira
+# extra_fields = { "System.AreaPath" = "Esko\\Team A" }            # Azure DevOps
