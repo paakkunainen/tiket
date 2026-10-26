@@ -69,7 +69,9 @@ def _expand(value: str) -> str:
     def repl(m: re.Match) -> str:
         name = m.group(1)
         if name not in os.environ:
-            raise ConfigError(f"Environment variable {name} is not set (check your .env)")
+            raise ConfigError(
+                f"Environment variable {name} is not set (check your .env)"
+            )
         return os.environ[name]
 
     return re.sub(r"\$\{(\w+)\}", repl, value)
@@ -78,15 +80,24 @@ def _expand(value: str) -> str:
 def _load_raw() -> tuple[Path, dict]:
     path = find_config_path()
     # .env next to the config (resolving symlinks) and in ~/.config/tiket
-    for env_file in {path.parent / ".env", path.resolve().parent / ".env", CONFIG_DIR / ".env"}:
+    for env_file in {
+        path.parent / ".env",
+        path.resolve().parent / ".env",
+        CONFIG_DIR / ".env",
+    }:
         if env_file.is_file():
             load_dotenv(env_file, override=False)
     return path, tomllib.loads(path.read_text())
 
 
 def _site(name: str, s: dict) -> Site:
-    return Site(name=name, kind=s["kind"], url=s["url"].rstrip("/"),
-                token=_expand(s["token"]), email=s.get("email"))
+    return Site(
+        name=name,
+        kind=s["kind"],
+        url=s["url"].rstrip("/"),
+        token=_expand(s["token"]),
+        email=s.get("email"),
+    )
 
 
 def load_config() -> Config:

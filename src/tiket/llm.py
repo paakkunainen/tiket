@@ -57,7 +57,7 @@ def _format_examples(examples: list[Example]) -> str:
                 desc = desc[:EXAMPLE_CHARS].rstrip() + " …"
             part = f"--- {issue_type} ---\nTitle: {e.title}\nDescription:\n{desc}"
             if e.acceptance_criteria.strip():
-                part += f"\nAcceptance criteria:\n{e.acceptance_criteria.strip()[:EXAMPLE_CHARS // 2]}"
+                part += f"\nAcceptance criteria:\n{e.acceptance_criteria.strip()[: EXAMPLE_CHARS // 2]}"
             parts.append(part)
     return "\n\n".join(parts)
 
@@ -67,7 +67,11 @@ def detect_language(examples: list[Example]) -> str:
     words = re.findall(r"\w+", text)
     if not words:
         return "English"
-    finnish = sum(1 for w in words if re.search(r"[äö]", w) or w in {"ja", "on", "ei", "kun", "että", "tai"})
+    finnish = sum(
+        1
+        for w in words
+        if re.search(r"[äö]", w) or w in {"ja", "on", "ei", "kun", "että", "tai"}
+    )
     return "Finnish" if finnish / len(words) > 0.05 else "English"
 
 
@@ -84,20 +88,43 @@ def generate(
     language = project.language or settings.language
     if language == "auto":
         language = detect_language(examples)
-    notes = f"\nTeam style notes: {project.style_notes}\n" if project.style_notes else ""
+    notes = (
+        f"\nTeam style notes: {project.style_notes}\n" if project.style_notes else ""
+    )
     messages = [
-        {"role": "system", "content": SYSTEM.format(
-            project=project.project, language=language, types=", ".join(types),
-            notes=notes, examples=_format_examples(examples), ac_rule=AC_RULE if ac_field else "",
-        )},
-        {"role": "user", "content": (
-            f"Problem description:\n{user_text}\n\n"
-            f"Write the ticket in {language}, in this team's style, using only the facts above."
-        )},
+        {
+            "role": "system",
+            "content": SYSTEM.format(
+                project=project.project,
+                language=language,
+                types=", ".join(types),
+                notes=notes,
+                examples=_format_examples(examples),
+                ac_rule=AC_RULE if ac_field else "",
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Problem description:\n{user_text}\n\n"
+                f"Write the ticket in {language}, in this team's style, using only the facts above."
+            ),
+        },
     ]
     if previous:
-        messages.append({"role": "assistant", "content": json.dumps(previous.__dict__, ensure_ascii=False)})
-        messages.append({"role": "user", "content": "Rewrite the ticket. " + (feedback or "Try a different wording.")})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(previous.__dict__, ensure_ascii=False),
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": "Rewrite the ticket. "
+                + (feedback or "Try a different wording."),
+            }
+        )
 
     schema = {
         "type": "object",
@@ -122,9 +149,13 @@ def generate(
         payload["think"] = settings.think
 
     try:
-        r = httpx.post(f"{settings.url.rstrip('/')}/api/chat", json=payload, timeout=300)
+        r = httpx.post(
+            f"{settings.url.rstrip('/')}/api/chat", json=payload, timeout=300
+        )
     except httpx.ConnectError:
-        raise RuntimeError(f"Cannot reach Ollama at {settings.url} — is `ollama serve` running?")
+        raise RuntimeError(
+            f"Cannot reach Ollama at {settings.url} — is `ollama serve` running?"
+        )
     if r.is_error:
         raise RuntimeError(f"Ollama error {r.status_code}: {r.text[:500]}")
     content = r.json()["message"]["content"]

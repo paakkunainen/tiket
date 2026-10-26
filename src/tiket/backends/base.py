@@ -19,6 +19,7 @@ class Example:
 @dataclass
 class Item:
     """A ticket assigned to the current user."""
+
     ref: str
     title: str
     issue_type: str
@@ -33,7 +34,8 @@ class MissingFieldsError(RuntimeError):
     """The tracker rejected the ticket because required fields were empty."""
 
     def __init__(self, fields: list[tuple[str, str]], raw: str):
-        self.fields = fields  # (field reference used in the API, human readable label / message)
+        # (field reference used in the API, human readable label / message)
+        self.fields = fields
         super().__init__(raw)
 
 
@@ -50,14 +52,22 @@ class Backend(Protocol):
     def issue_types(self) -> list[str]:
         """Issue / work item type names that can be created in the project."""
 
-    def my_items(self, project: str | None, text: str | None, include_done: bool, limit: int) -> list[Item]:
+    def my_items(
+        self, project: str | None, text: str | None, include_done: bool, limit: int
+    ) -> list[Item]:
         """Tickets assigned to me, newest change first; project/text filters are applied server side."""
 
     def recent_examples(self, n: int, filter_types: bool = True) -> list[Example]:
         """Newest tickets; limited to project.types when set and filter_types is true."""
 
-    def create(self, title: str, description_md: str, issue_type: str,
-               acceptance_criteria_md: str = "", extra_fields: dict | None = None) -> str:
+    def create(
+        self,
+        title: str,
+        description_md: str,
+        issue_type: str,
+        acceptance_criteria_md: str = "",
+        extra_fields: dict | None = None,
+    ) -> str:
         """Create the ticket, return its browser URL."""
 
 

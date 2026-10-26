@@ -9,7 +9,11 @@ tiket <alias> "..." --dry-run                # just show what would be created
 tiket <alias> -t bug "..."                   # set the type yourself (bug / task / story / feature /
                                              # improvement, or the exact name); omit to let the model pick
 tiket <alias> "..." --refresh                # re-fetch style examples
-tiket tasks                                  # my open tickets on every board, newest change first
+tiket tasks                                  # my open tickets on every board, grouped by project
+                                             #   j/k g/G ctrl-d/u move · y yank "KEY Title" · Y yank url
+                                             #   o/enter open in browser · / filter · esc clear · q quit
+tiket tasks --plain                          # print a table instead (also automatic when piped)
+tiket tasks -o updated                       # order by: project (default), updated, key, type, status
 tiket tasks bf esko -s cdc                   # filter by alias / site / project key, and title text
 tiket tasks digifinland -a                   # include done/closed tickets
 tiket list | doctor | projects <site>

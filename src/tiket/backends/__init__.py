@@ -9,7 +9,9 @@ def make_backend(site: Site, project: Project | None = None) -> Backend:
         return JiraBackend(site, project)
     if site.kind == "azure_devops":
         return AzureDevOpsBackend(site, project)
-    raise ValueError(f"Unknown site kind '{site.kind}' (use jira_cloud, jira_dc or azure_devops)")
+    raise ValueError(
+        f"Unknown site kind '{site.kind}' (use jira_cloud, jira_dc or azure_devops)"
+    )
 
 
 __all__ = ["Backend", "Example", "Item", "MissingFieldsError", "make_backend"]

@@ -9,6 +9,7 @@ dependencies = [
     "rich>=13",
     "python-dotenv>=1.0",
     "markdown>=3.6",
+    "textual>=8.2.8",
 ]
 
 [project.scripts]
