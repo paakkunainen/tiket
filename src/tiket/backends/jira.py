@@ -1,9 +1,24 @@
+import difflib
 import re
 
 import httpx
 
 from ..config import Project, Site
-from .base import Example, Item, MissingFieldsError, html_to_text
+from .base import (
+    Choice,
+    Created,
+    Draft,
+    Example,
+    Item,
+    MissingFieldsError,
+    Profile,
+    html_to_text,
+    rank,
+)
+
+PROFILE_SAMPLE = 50
+# Fields every ticket needs; anything else we set is a "detail" that may be dropped if Jira rejects it
+BASE_FIELDS = {"project", "summary", "description", "issuetype"}
 
 
 def md_to_jira(md: str) -> str:
@@ -82,12 +97,6 @@ class JiraBackend:
 
     def _req(self, method: str, path: str, **kw) -> dict | list:
         r = self.http.request(method, path, **kw)
-        if r.status_code == 400 and method == "POST" and path.endswith("/issue"):
-            errors = r.json().get("errors") or {}
-            if missing := [
-                (k, v) for k, v in errors.items() if "required" in v.lower()
-            ]:
-                raise MissingFieldsError(missing, r.text)
         if r.is_error:
             raise RuntimeError(
                 f"Jira {method} {path} -> {r.status_code}: {r.text[:1000]}"
@@ -188,28 +197,214 @@ class JiraBackend:
             for i in issues
         ]
 
+    # --- ticket details ------------------------------------------------------
+
+    def _field_ids(self) -> tuple[dict[str, str], list[str]]:
+        """Custom field ids differ per Jira instance; find them by type."""
+        ids: dict[str, str] = {}
+        story_point_fields = []
+        for f in self._req("GET", "/rest/api/2/field"):
+            custom = (f.get("schema") or {}).get("custom") or ""
+            if custom.endswith(":gh-sprint"):
+                ids.setdefault("sprint", f["id"])
+            elif custom.endswith(":gh-epic-link"):
+                ids.setdefault("epic_link", f["id"])
+            elif "story point" in f["name"].lower() and custom.endswith(
+                (":float", ":jsw-story-points")
+            ):
+                story_point_fields.append(f["id"])
+        return ids, story_point_fields
+
+    def field_profile(self) -> Profile:
+        ids, story_point_fields = self._field_ids()
+        fields = ["summary", "issuetype", "parent", "priority", "components", "labels"]
+        fields += [*ids.values(), *story_point_fields]
+        jql = (
+            f"project = {_jql_str(self.project.project)} AND "
+            "(assignee = currentUser() OR reporter = currentUser()) ORDER BY created DESC"
+        )
+        issues = [
+            i
+            for i in self._search(jql, PROFILE_SAMPLE, fields)
+            if not i["fields"]["issuetype"].get("subtask")
+        ]
+        if not issues:
+            return Profile(field_ids=ids)
+
+        # Several "story points" fields may exist; use the one this project fills in
+        def filled(fid: str) -> int:
+            return sum(1 for i in issues if i["fields"].get(fid) is not None)
+
+        if story_point_fields and filled(best := max(story_point_fields, key=filled)):
+            ids["story_points"] = best
+
+        parent_keys = []
+        for i in issues:
+            f = i["fields"]
+            key = (f.get("parent") or {}).get("key") if self.cloud else None
+            if key := key or f.get(ids.get("epic_link", "")):
+                parent_keys.append(key)
+        open_parents = self._open_issue_labels(set(parent_keys))
+
+        def values(name: str) -> list[dict]:
+            return [v for i in issues for v in i["fields"].get(name) or []]
+
+        sp = ids.get("story_points")
+        return Profile(
+            sample=len(issues),
+            parents=rank([(k, open_parents[k]) for k in parent_keys if k in open_parents]),
+            components=rank([(c["name"], c["name"]) for c in values("components")]),
+            labels=rank([(label, label) for label in values("labels")]),
+            priorities=rank(
+                [(p["name"], p["name"]) for i in issues if (p := i["fields"].get("priority"))]
+            ),
+            points=[
+                (i["fields"]["summary"], float(i["fields"][sp]))
+                for i in issues
+                if sp and i["fields"].get(sp) is not None
+            ],
+            sprint_hint=self._sprint_hint(issues, ids.get("sprint")),
+            field_ids=ids,
+        )
+
+    def _open_issue_labels(self, keys: set[str]) -> dict[str, str]:
+        """{key: "KEY summary"} for the given issues that are not done."""
+        if not keys:
+            return {}
+        jql = f"key in ({', '.join(sorted(keys))}) AND statusCategory != Done"
+        try:
+            issues = self._search(jql, len(keys), ["summary"])
+        except RuntimeError:  # e.g. a parent was deleted or moved; keep them unlabelled
+            return {k: k for k in keys}
+        return {i["key"]: f"{i['key']} {i['fields']['summary']}" for i in issues}
+
+    def _sprint_hint(self, issues: list[dict], sprint_field: str | None) -> dict:
+        """Board and name of the newest sprint the user's recent tickets were in."""
+        for i in issues:
+            sprints = [_parse_sprint(s) for s in i["fields"].get(sprint_field or "") or []]
+            if sprints := [s for s in sprints if s.get("board")]:
+                latest = max(sprints, key=lambda s: int(s["id"]))
+                return {"board": int(latest["board"]), "name": latest["name"]}
+        return {}
+
+    def current_sprint(self, profile: Profile) -> Choice | None:
+        hint = profile.sprint_hint
+        if not hint.get("board"):
+            return None
+        try:
+            data = self._req(
+                "GET",
+                f"/rest/agile/1.0/board/{hint['board']}/sprint",
+                params={"state": "active,future", "maxResults": 50},
+            )
+        except RuntimeError:
+            return None
+        sprints = data.get("values", [])
+        # Boards can show sprints from other boards; prefer the ones that belong to this board
+        own = [s for s in sprints if s.get("originBoardId", hint["board"]) == hint["board"]]
+        sprints = own or sprints
+        pool = [s for s in sprints if s["state"] == "active"] or [
+            s for s in sprints if s["state"] == "future"
+        ]
+        if not pool:
+            return None
+        family = _sprint_family(hint["name"])
+
+        def score(s: dict) -> tuple:
+            similarity = difflib.SequenceMatcher(None, _sprint_family(s["name"]), family).ratio()
+            return (-round(similarity, 1), s.get("startDate") or "9999", s["id"])
+
+        best = min(pool, key=score)
+        when = "active" if best["state"] == "active" else "next"
+        return Choice(str(best["id"]), f"{best['name']} ({when})")
+
     def create(
-        self,
-        title: str,
-        description_md: str,
-        issue_type: str,
-        acceptance_criteria_md: str = "",
-        extra_fields: dict | None = None,
-    ) -> str:
-        if acceptance_criteria_md:
-            description_md += "\n\n" + acceptance_criteria_md
+        self, draft: Draft, profile: Profile, extra_fields: dict | None = None
+    ) -> Created:
+        d = draft.details
+        ids = profile.field_ids
+        description_md = draft.description
+        if draft.acceptance_criteria:
+            description_md += "\n\n" + draft.acceptance_criteria
         fields = {
             "project": {"key": self.project.project},
-            "summary": title,
+            "summary": draft.title,
             "description": md_to_jira(description_md),
-            "issuetype": {"name": issue_type},
-            **self.project.extra_fields,
-            **(extra_fields or {}),
+            "issuetype": {"name": draft.issue_type},
         }
+        if d.parent:
+            if self.cloud:
+                fields["parent"] = {"key": d.parent.value}
+            elif "epic_link" in ids:
+                fields[ids["epic_link"]] = d.parent.value
+        if d.story_points is not None and "story_points" in ids:
+            fields[ids["story_points"]] = d.story_points
+        if d.priority:
+            fields["priority"] = {"name": d.priority}
+        if d.components:
+            fields["components"] = [{"name": c} for c in d.components]
+        if d.labels:
+            fields["labels"] = d.labels
         if self.project.assign_to_me:
             me = self._myself()
             fields["assignee"] = (
                 {"accountId": me["accountId"]} if self.cloud else {"name": me["name"]}
             )
-        key = self._req("POST", "/rest/api/2/issue", json={"fields": fields})["key"]
-        return f"{self.site.url}/browse/{key}"
+        fields |= self.project.extra_fields | (extra_fields or {})
+
+        names = {v: k.replace("_", " ") for k, v in ids.items()}
+        key, deferred, warnings = self._create_issue(fields, names)
+        if deferred:
+            try:
+                self._req("PUT", f"/rest/api/2/issue/{key}", json={"fields": deferred})
+            except RuntimeError as e:
+                labels = ", ".join(names.get(k, k) for k in deferred)
+                warnings.append(f"Could not set {labels}: {e}")
+        if d.sprint:
+            try:
+                self._req(
+                    "POST",
+                    f"/rest/agile/1.0/sprint/{d.sprint.value}/issue",
+                    json={"issues": [key]},
+                )
+            except RuntimeError as e:
+                warnings.append(f"Could not add to sprint {d.sprint.label}: {e}")
+        return Created(f"{self.site.url}/browse/{key}", warnings)
+
+    def _create_issue(
+        self, fields: dict, names: dict[str, str]
+    ) -> tuple[str, dict, list[str]]:
+        """POST the issue. Details that aren't on the create screen are returned for a follow-up edit;
+        details Jira rejects outright are dropped with a warning, so the ticket itself still gets created."""
+        deferred: dict = {}
+        warnings: list[str] = []
+        for _ in range(4):
+            r = self.http.post("/rest/api/2/issue", json={"fields": fields})
+            if r.is_success:
+                return r.json()["key"], deferred, warnings
+            errors = (r.json().get("errors") or {}) if r.status_code == 400 else {}
+            if missing := [(k, v) for k, v in errors.items() if "required" in v.lower()]:
+                raise MissingFieldsError(missing, r.text)
+            details = [k for k in errors if k in fields and k not in BASE_FIELDS]
+            if not details:
+                break
+            for k in details:
+                if "appropriate screen" in errors[k] or "cannot be set" in errors[k]:
+                    deferred[k] = fields.pop(k)
+                else:
+                    fields.pop(k)
+                    warnings.append(f"Skipped {names.get(k, k)}: {errors[k]}")
+        raise RuntimeError(f"Jira POST /rest/api/2/issue -> {r.status_code}: {r.text[:1000]}")
+
+
+def _parse_sprint(s: dict | str) -> dict:
+    """Cloud returns sprint objects, Data Center a "...Sprint@1a2b[id=1,name=x,...]" string."""
+    if isinstance(s, dict):
+        return {"id": s.get("id"), "name": s.get("name", ""), "board": s.get("boardId")}
+    attrs = dict(re.findall(r"(\w+)=([^,\]]*)", s))
+    return {"id": attrs.get("id", 0), "name": attrs.get("name", ""), "board": attrs.get("rapidViewId")}
+
+
+def _sprint_family(name: str) -> str:
+    # "JOD TA Ylläpito Sprint37" and "...Sprint38" are the same series
+    return re.sub(r"\d+", "#", name.lower())

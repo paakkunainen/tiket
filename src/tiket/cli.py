@@ -15,15 +15,34 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+from . import aliases
+from . import details as ticket_details
 from . import llm, style_cache
-from .backends import Example, Item, MissingFieldsError, make_backend
+from .backends import Draft, Example, Item, MissingFieldsError, Profile, make_backend
 from .config import ConfigError, load_config, load_sites
 
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
-    help="AI-written tickets for Jira / Azure DevOps.",
+    rich_markup_mode="markdown",
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help="""Create tickets in Jira / Azure DevOps from a one-line description, written by a local
+model (Ollama) in each team's own style, and browse the tickets assigned to you.
+
+`tiket <alias> "…"` is short for `tiket new <alias> "…"`. Run `tiket <command> -h` for details.""",
+    epilog="""**Examples**
+
+```
+tiket bf "dashboard latautuu hitaasti koko vuoden aikavälillä"
+tiket esko -t bug "kirjautuminen kaatuu safarilla"     # set the type yourself
+tiket                                                  # pick project, then describe
+tiket tasks                                            # browse your tickets, y = copy
+tiket alias                                            # list / add / rename project aliases
+tiket doctor                                           # check Ollama and all credentials
+```
+""",
 )
+app.add_typer(aliases.app, name="alias")
 console = Console()
 AC_MARKER = "--- acceptance criteria ---"
 DUPLICATE_RATIO = 0.8
@@ -49,7 +68,7 @@ TYPE_SYNONYMS |= {
     "tarina": TYPE_SYNONYMS["story"],
     "parannus": TYPE_SYNONYMS["improvement"],
 }
-SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks"}
+SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "alias", "config"}
 # Work item types that are never a sensible target or style example for a quick ticket
 IGNORED_TYPES = {
     "Test Case",
@@ -66,27 +85,59 @@ IGNORED_TYPES = {
 }
 
 
-@app.command()
+@app.command(
+    epilog="""**Examples**
+
+```
+tiket bf "power bi raportin päivitys epäonnistuu yöllä"
+tiket tijo -t bug "aineistopäivitys kaatuu"    # bug → Virhe on TIJOFI
+tiket esko "…" -n                              # preview only
+tiket edu "…" -D                               # no guessed details
+tiket edu "…" -r                               # re-read recent tickets first
+```
+"""
+)
 def new(
     alias: str = typer.Argument(
         None, help="Project alias from config (omit for a picker)"
     ),
-    text: list[str] = typer.Argument(None, help="Short description of the problem"),
+    text: list[str] = typer.Argument(
+        None, help="Short description of the problem; asked for if left out"
+    ),
     issue_type: str = typer.Option(
         None,
         "--type",
         "-t",
-        help="Issue type, e.g. bug / task / story / feature or the exact name. Omit to let the model choose.",
+        help="Issue type: bug, task, story, feature, improvement (or Finnish: virhe, tehtävä, "
+        "tarina, parannus), or the exact type name. Omit to let the model choose.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", "-n", help="Generate only, never create"
     ),
     refresh: bool = typer.Option(
-        False, "--refresh", "-r", help="Re-fetch style examples"
+        False,
+        "--refresh",
+        "-r",
+        help="Re-read recent tickets (style and detail history are cached for 24 h)",
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Create without asking"),
+    no_details: bool = typer.Option(
+        False,
+        "--no-details",
+        "-D",
+        help="Don't guess parent, story points, priority, components, labels or sprint",
+    ),
 ):
-    """Create a ticket: tiket <alias> "what is broken"."""
+    """Create a ticket from a short description.
+
+    The model reads the project's recent tickets and writes the title, description (and acceptance
+    criteria on Azure DevOps) in the same language and style. It also fills in **details** guessed
+    from your own recent tickets there: parent/epic, story points, priority, components, labels,
+    the current sprint / iteration and area, with you as the assignee.
+
+    You get a preview first: **y** create · **r** rewrite (optionally with feedback such as
+    "shorter") · **e** edit everything in $EDITOR, where `none` clears a detail · **n** cancel.
+    """
     cfg = load_config()
     if not cfg.projects:
         _die(f"No projects configured in {cfg.path}")
@@ -109,6 +160,10 @@ def new(
             project, backend, cfg.ollama.examples, refresh=refresh
         )
         creatable = [t for t in backend.issue_types() if t not in IGNORED_TYPES]
+        profile, sprint = Profile(), None
+        if project.guess_details and not no_details:
+            profile = style_cache.get_profile(project, backend, refresh=refresh)
+            sprint = backend.current_sprint(profile)
     examples = [e for e in examples if e.issue_type not in IGNORED_TYPES]
 
     if issue_type:
@@ -138,6 +193,8 @@ def new(
                 draft,
                 feedback,
                 ac_field=backend.separate_acceptance_criteria,
+                profile=profile,
+                sprint=sprint,
             )
         _show(draft, project)
         _warn_duplicates(draft, examples)
@@ -174,13 +231,7 @@ def new(
     while True:
         try:
             with console.status("Creating ticket…"):
-                url = backend.create(
-                    draft.title,
-                    draft.description,
-                    draft.issue_type,
-                    draft.acceptance_criteria,
-                    extra,
-                )
+                created = backend.create(draft, profile, extra)
             break
         except MissingFieldsError as e:
             console.print(
@@ -194,7 +245,9 @@ def new(
                 if not value:
                     raise typer.Exit(1)
                 extra[ref] = _parse_value(value)
-    console.print(f"[bold green]Created:[/] {url}")
+    console.print(f"[bold green]Created:[/] {created.url}")
+    for warning in created.warnings:
+        console.print(f"[yellow]⚠ {warning}[/]")
 
 
 def _natural_key(ref: str) -> tuple:
@@ -212,7 +265,28 @@ TASK_SORTS = {
 }
 
 
-@app.command()
+@app.command(
+    epilog="""**Keys** (interactive view)
+
+```
+j / k, arrows     move              y        copy "KEY Title"
+g / G             first / last      Y        copy the URL
+ctrl-d / ctrl-u   half page         o, enter open in browser
+/                 filter            esc      clear filter
+q                 quit
+```
+
+**Examples**
+
+```
+tiket tasks                       # all open tickets, grouped by project
+tiket tasks bf esko               # only these aliases
+tiket tasks digifinland -a        # a whole site, including done tickets
+tiket tasks -s snowflake -o updated
+tiket tasks --plain | grep BI-    # plain table (automatic when piped)
+```
+"""
+)
 def tasks(
     where: list[str] = typer.Argument(
         None,
@@ -237,7 +311,10 @@ def tasks(
         False, "--plain", "-p", help="Print a table instead of the interactive view"
     ),
 ):
-    """List tickets assigned to you across all boards."""
+    """Browse the tickets assigned to you on every board.
+
+    Opens an interactive list with vim keys; **y** copies "KEY Title" to the clipboard.
+    """
     if sort not in TASK_SORTS:
         _die(f"Unknown sort '{sort}'. Use one of: {', '.join(TASK_SORTS)}")
     cfg = load_config()
@@ -356,20 +433,21 @@ def tasks(
     )
 
 
-@app.command("list")
+@app.command("list", hidden=True)
 def list_cmd():
-    """Show configured project aliases."""
-    cfg = load_config()
-    table = Table("alias", "site", "kind", "project", "default type")
-    for a, p in cfg.projects.items():
-        table.add_row(a, p.site.name, p.site.kind, p.project, p.default_type)
-    console.print(table)
-    console.print(f"[dim]config: {cfg.path}[/]")
+    """Show project aliases (same as `tiket alias`)."""
+    aliases.list_aliases()
+
+
+@app.command("config")
+def config_cmd():
+    """Open config.toml in your editor; it is validated when you close it."""
+    aliases.edit_config()
 
 
 @app.command()
 def projects(site: str = typer.Argument(..., help="Site name from config")):
-    """List the project keys a site's token can see (to fill in config)."""
+    """List the projects a site's token can see, e.g. before `tiket alias add`."""
     sites = load_sites()
     if site not in sites:
         _die(f"Unknown site '{site}'. Configured: {', '.join(sites)}")
@@ -417,7 +495,7 @@ def _pick_alias(projects) -> str:
     return aliases[int(choice) - 1] if choice.isdigit() else choice
 
 
-def _show(draft: llm.Draft, project) -> None:
+def _show(draft: Draft, project) -> None:
     body = draft.description
     if draft.acceptance_criteria:
         body += "\n\n---\n\n**Acceptance criteria**\n\n" + draft.acceptance_criteria
@@ -429,13 +507,20 @@ def _show(draft: llm.Draft, project) -> None:
             expand=True,
         )
     )
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="dim", no_wrap=True)
+    grid.add_column()
+    for name, value in ticket_details.rows(draft.details, project.assign_to_me):
+        grid.add_row(name, value)
+    console.print(grid)
 
 
-def _edit(draft: llm.Draft) -> llm.Draft:
+def _edit(draft: Draft) -> Draft:
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
     with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as f:
         f.write(
-            f"Type: {draft.issue_type}\nTitle: {draft.title}\n---\n{draft.description}\n"
+            f"Type: {draft.issue_type}\nTitle: {draft.title}\n"
+            f"{ticket_details.to_editor(draft.details)}\n---\n{draft.description}\n"
         )
         if draft.acceptance_criteria:
             f.write(f"\n{AC_MARKER}\n{draft.acceptance_criteria}\n")
@@ -447,16 +532,20 @@ def _edit(draft: llm.Draft) -> llm.Draft:
         os.unlink(path)
     head, _, body = content.partition("\n---\n")
     body, _, acceptance = body.partition(AC_MARKER)
-    meta = dict(line.split(":", 1) for line in head.splitlines() if ":" in line)
-    return llm.Draft(
-        title=meta.get("Title", draft.title).strip(),
-        issue_type=meta.get("Type", draft.issue_type).strip(),
+    meta = {
+        k.strip(): v.strip()
+        for k, v in (line.split(":", 1) for line in head.splitlines() if ":" in line)
+    }
+    return Draft(
+        title=meta.get("Title", draft.title),
+        issue_type=meta.get("Type", draft.issue_type),
         description=body.strip(),
         acceptance_criteria=acceptance.strip(),
+        details=ticket_details.from_editor(meta, draft.details),
     )
 
 
-def _warn_duplicates(draft: llm.Draft, examples: list[Example]) -> None:
+def _warn_duplicates(draft: Draft, examples: list[Example]) -> None:
     title = draft.title.lower()
     for e in examples:
         if (
@@ -510,7 +599,7 @@ def _die(msg: str):
 
 
 def main():
-    # `tiket bf "text"` → `tiket new bf "text"`
+    # `tiket bf "text"` → `tiket new bf "text"`; bare `tiket -h` stays the overview
     args = sys.argv[1:]
     if not args or (args[0] not in SUBCOMMANDS and args[0] not in ("--help", "-h")):
         sys.argv.insert(1, "new")

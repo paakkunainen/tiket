@@ -1,6 +1,16 @@
 from ..config import Project, Site
 from .azure_devops import AzureDevOpsBackend
-from .base import Backend, Example, Item, MissingFieldsError
+from .base import (
+    Backend,
+    Choice,
+    Created,
+    Details,
+    Draft,
+    Example,
+    Item,
+    MissingFieldsError,
+    Profile,
+)
 from .jira import JiraBackend
 
 
@@ -14,4 +24,15 @@ def make_backend(site: Site, project: Project | None = None) -> Backend:
     )
 
 
-__all__ = ["Backend", "Example", "Item", "MissingFieldsError", "make_backend"]
+__all__ = [
+    "Backend",
+    "Choice",
+    "Created",
+    "Details",
+    "Draft",
+    "Example",
+    "Item",
+    "MissingFieldsError",
+    "Profile",
+    "make_backend",
+]

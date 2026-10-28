@@ -33,7 +33,8 @@ class Project:
     language: str | None = None
     style_notes: str = ""
     extra_fields: dict = field(default_factory=dict)
-    assign_to_me: bool = False
+    assign_to_me: bool = True
+    guess_details: bool = True
 
 
 @dataclass
@@ -119,7 +120,8 @@ def load_config() -> Config:
             language=p.get("language"),
             style_notes=p.get("style_notes", ""),
             extra_fields=p.get("extra_fields", {}),
-            assign_to_me=p.get("assign_to_me", False),
+            assign_to_me=p.get("assign_to_me", True),
+            guess_details=p.get("guess_details", True),
         )
     return Config(path=path, ollama=ollama, projects=projects)
 

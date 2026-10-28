@@ -1,6 +1,6 @@
 import html
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
 
@@ -28,6 +28,67 @@ class Item:
     updated: str  # ISO timestamp
     url: str
     done: bool = False
+
+
+@dataclass
+class Choice:
+    value: str  # what the API needs: issue key, work item id, sprint id, iteration path…
+    label: str  # what people and the model see
+    count: int = 0  # how many of the user's recent tickets used it
+
+
+@dataclass
+class Profile:
+    """How the current user usually fills in ticket details in a project, learned from their recent tickets."""
+
+    sample: int = 0
+    parents: list[Choice] = field(default_factory=list)
+    components: list[Choice] = field(default_factory=list)
+    labels: list[Choice] = field(default_factory=list)
+    priorities: list[Choice] = field(default_factory=list)
+    points: list[tuple[str, float]] = field(default_factory=list)  # (title, story points)
+    area: str | None = None  # ADO area path
+    sprint_hint: dict = field(default_factory=dict)  # where to look for the current sprint / iteration
+    field_ids: dict = field(default_factory=dict)  # Jira custom field ids (story points, sprint, epic link)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Profile":
+        d = dict(d)
+        for key in ("parents", "components", "labels", "priorities"):
+            d[key] = [Choice(**c) for c in d.get(key, [])]
+        d["points"] = [tuple(p) for p in d.get("points", [])]
+        return cls(**d)
+
+
+@dataclass
+class Details:
+    """Ticket details to set on creation; guessed from the Profile, editable before creating."""
+
+    parent: Choice | None = None
+    story_points: float | None = None
+    priority: str | None = None
+    components: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
+    sprint: Choice | None = None
+    area: str | None = None
+
+
+@dataclass
+class Draft:
+    title: str
+    description: str
+    issue_type: str
+    acceptance_criteria: str = ""
+    details: Details = field(default_factory=Details)
+
+
+@dataclass
+class Created:
+    url: str
+    warnings: list[str] = field(default_factory=list)  # details that could not be set
 
 
 class MissingFieldsError(RuntimeError):
@@ -60,15 +121,24 @@ class Backend(Protocol):
     def recent_examples(self, n: int, filter_types: bool = True) -> list[Example]:
         """Newest tickets; limited to project.types when set and filter_types is true."""
 
+    def field_profile(self) -> Profile:
+        """Learn parents, components, labels, priorities, points etc. from the user's recent tickets."""
+
+    def current_sprint(self, profile: Profile) -> Choice | None:
+        """The sprint / iteration a new ticket should go into today (never cached)."""
+
     def create(
-        self,
-        title: str,
-        description_md: str,
-        issue_type: str,
-        acceptance_criteria_md: str = "",
-        extra_fields: dict | None = None,
-    ) -> str:
-        """Create the ticket, return its browser URL."""
+        self, draft: Draft, profile: Profile, extra_fields: dict | None = None
+    ) -> Created:
+        """Create the ticket with its details."""
+
+
+def rank(values: list[tuple[str, str]]) -> list[Choice]:
+    """(value, label) pairs, newest first -> Choices ordered by how often they were used (ties: newest)."""
+    choices: dict[str, Choice] = {}
+    for value, label in values:
+        choices.setdefault(value, Choice(value, label)).count += 1
+    return sorted(choices.values(), key=lambda c: -c.count)
 
 
 def html_to_text(s: str | None) -> str:

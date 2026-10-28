@@ -1,10 +1,10 @@
 import json
 import re
-from dataclasses import dataclass
 
 import httpx
 
-from .backends import Example
+from . import details as ticket_details
+from .backends import Choice, Draft, Example, Profile
 from .config import OllamaSettings, Project
 
 EXAMPLE_CHARS = 800
@@ -26,20 +26,13 @@ Existing tickets from this project, grouped by issue type:
   put one short "TODO:" line in it. Use at most 2 TODOs and skip sections you have nothing for.
 - Description in Markdown (it is converted to the tracker's format afterwards).
 - issue_type must be one of: {types}.
-{ac_rule}{notes}"""
+{ac_rule}{notes}
+{details}"""
 
 AC_RULE = """- acceptance_criteria: this tracker has a separate Acceptance Criteria field. Fill it (Markdown bullet
   list, same language and style as the examples' acceptance criteria) for every type except Bug; keep it to
   what the user's description actually implies. Do not repeat it in the description.
 """
-
-
-@dataclass
-class Draft:
-    title: str
-    description: str
-    issue_type: str
-    acceptance_criteria: str = ""
 
 
 def _format_examples(examples: list[Example]) -> str:
@@ -84,7 +77,10 @@ def generate(
     previous: Draft | None = None,
     feedback: str | None = None,
     ac_field: bool = False,
+    profile: Profile | None = None,
+    sprint: Choice | None = None,
 ) -> Draft:
+    profile = profile or Profile()
     language = project.language or settings.language
     if language == "auto":
         language = detect_language(examples)
@@ -101,6 +97,7 @@ def generate(
                 notes=notes,
                 examples=_format_examples(examples),
                 ac_rule=AC_RULE if ac_field else "",
+                details=ticket_details.prompt_section(profile),
             ),
         },
         {
@@ -115,7 +112,16 @@ def generate(
         messages.append(
             {
                 "role": "assistant",
-                "content": json.dumps(previous.__dict__, ensure_ascii=False),
+                "content": json.dumps(
+                    {
+                        "title": previous.title,
+                        "description": previous.description,
+                        "issue_type": previous.issue_type,
+                        "acceptance_criteria": previous.acceptance_criteria,
+                        **ticket_details.to_model(previous.details),
+                    },
+                    ensure_ascii=False,
+                ),
             }
         )
         messages.append(
@@ -138,6 +144,9 @@ def generate(
     if ac_field:
         schema["properties"]["acceptance_criteria"] = {"type": "string"}
         schema["required"].append("acceptance_criteria")
+    detail_props = ticket_details.schema_properties(profile)
+    schema["properties"] |= detail_props
+    schema["required"] += list(detail_props)
     payload = {
         "model": settings.model,
         "messages": messages,
@@ -166,6 +175,7 @@ def generate(
         description=data["description"].strip(),
         issue_type=issue_type,
         acceptance_criteria=(data.get("acceptance_criteria") or "").strip(),
+        details=ticket_details.from_model(data, profile, sprint),
     )
 
 

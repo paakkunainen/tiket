@@ -54,6 +54,8 @@ default_type = "Task"
 # types = ["Task", "Bug"]          # issue types the model may pick (default: default_type + types seen in recent tickets)
 # language = "Finnish"            # override [ollama].language for this project
 # style_notes = "Titles in Finnish, always add acceptance criteria"
-# assign_to_me = true
+# assign_to_me = false           # default true
+# guess_details = false          # default true: parent/epic, story points, priority, components,
+#                                  labels, sprint/iteration and area guessed from your recent tickets
 # extra_fields = { labels = ["frontend"] }                         # Jira
 # extra_fields = { "System.AreaPath" = "Esko\\Team A" }            # Azure DevOps

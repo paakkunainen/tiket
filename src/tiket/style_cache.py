@@ -2,7 +2,7 @@ import json
 import re
 import time
 
-from .backends import Backend, Example
+from .backends import Backend, Example, Profile
 from .config import CACHE_DIR, Project
 
 TTL_SECONDS = 24 * 3600
@@ -34,3 +34,19 @@ def get_examples(
         )
     )
     return examples
+
+
+def get_profile(project: Project, backend: Backend, refresh: bool = False) -> Profile:
+    """The user's usual ticket details for the project (the current sprint is looked up separately)."""
+    safe_key = re.sub(r"[^\w-]", "_", project.project)
+    path = CACHE_DIR / f"{project.site.name}-{safe_key}.profile.json"
+    if not refresh and path.is_file():
+        data = json.loads(path.read_text())
+        if time.time() - data["fetched_at"] < TTL_SECONDS:
+            return Profile.from_dict(data["profile"])
+    profile = backend.field_profile()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"fetched_at": time.time(), "profile": profile.to_dict()}, ensure_ascii=False, indent=2)
+    )
+    return profile

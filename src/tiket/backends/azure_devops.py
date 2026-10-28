@@ -1,15 +1,30 @@
 import re
+from collections import Counter
+from datetime import date
 from urllib.parse import quote
 
 import httpx
 import markdown
 
 from ..config import Project, Site
-from .base import Example, Item, MissingFieldsError, html_to_text
+from .base import (
+    Choice,
+    Created,
+    Draft,
+    Example,
+    Item,
+    MissingFieldsError,
+    Profile,
+    html_to_text,
+    rank,
+)
 
 API = {"api-version": "7.1"}
 REPRO_STEPS = "Microsoft.VSTS.TCM.ReproSteps"
 ACCEPTANCE = "Microsoft.VSTS.Common.AcceptanceCriteria"
+STORY_POINTS = "Microsoft.VSTS.Scheduling.StoryPoints"
+PRIORITY = "Microsoft.VSTS.Common.Priority"
+PROFILE_SAMPLE = 50
 MD_EXTENSIONS = ["fenced_code", "tables", "sane_lists"]
 # States in the Completed / Removed categories across the org's processes
 DONE_STATES = [
@@ -177,32 +192,142 @@ class AzureDevOpsBackend:
         )
         return {f["referenceName"] for f in data["value"]}
 
+    # --- ticket details ------------------------------------------------------
+
+    def _work_items(self, ids: list[int], fields: list[str]) -> list[dict]:
+        if not ids:
+            return []
+        return self._req(
+            "GET",
+            "/_apis/wit/workitems",
+            params={"ids": ",".join(map(str, ids)), "fields": ",".join(fields)},
+        )["value"]
+
+    def field_profile(self) -> Profile:
+        wiql = {
+            "query": "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project"
+            " AND ([System.AssignedTo] = @Me OR [System.CreatedBy] = @Me)"
+            " ORDER BY [System.CreatedDate] DESC"
+        }
+        refs = self._req(
+            "POST",
+            f"/{self._proj()}/_apis/wit/wiql",
+            params={"$top": PROFILE_SAMPLE},
+            json=wiql,
+        )["workItems"]
+        fields = ["System.Title", "System.AreaPath", "System.IterationPath", "System.Parent", STORY_POINTS, PRIORITY]
+        items = [i["fields"] for i in self._work_items([r["id"] for r in refs], fields)]
+        if not items:
+            return Profile()
+
+        parent_ids = [f["System.Parent"] for f in items if f.get("System.Parent")]
+        open_parents = {
+            p["id"]: f"{p['id']} {p['fields']['System.Title']}"
+            for p in self._work_items(sorted(set(parent_ids)), ["System.Title", "System.State"])
+            if p["fields"]["System.State"] not in DONE_STATES
+        }
+        # Iterations live under a team root such as "Esko\1 TK"; remember the one the user works in
+        roots = Counter(
+            "\\".join(f["System.IterationPath"].split("\\")[:2])
+            for f in items
+            if f["System.IterationPath"].count("\\") >= 1
+        )
+        areas = Counter(f["System.AreaPath"] for f in items)
+        return Profile(
+            sample=len(items),
+            parents=rank([(str(p), open_parents[p]) for p in parent_ids if p in open_parents]),
+            priorities=rank([(str(f[PRIORITY]), str(f[PRIORITY])) for f in items if f.get(PRIORITY)]),
+            points=[(f["System.Title"], float(f[STORY_POINTS])) for f in items if f.get(STORY_POINTS)],
+            area=areas.most_common(1)[0][0],
+            sprint_hint={"root": roots.most_common(1)[0][0]} if roots else {},
+        )
+
+    def current_sprint(self, profile: Profile) -> Choice | None:
+        root = profile.sprint_hint.get("root")
+        if not root:
+            return None
+        tree = self._req(
+            "GET",
+            f"/{self._proj()}/_apis/wit/classificationnodes/Iterations",
+            params={"$depth": 6},
+        )
+        today = date.today().isoformat()
+        # (depth, start, path) of iterations under the user's root that run today / start later
+        current, upcoming = [], []
+
+        def walk(node: dict, path: str, depth: int) -> None:
+            attrs = node.get("attributes") or {}
+            start, finish = attrs.get("startDate", "")[:10], attrs.get("finishDate", "")[:10]
+            if start and finish and (path + "\\").startswith(root + "\\"):
+                if start <= today <= finish:
+                    current.append((depth, start, path))
+                elif start > today:
+                    upcoming.append((-depth, start, path))
+            for child in node.get("children", []):
+                walk(child, f"{path}\\{child['name']}", depth + 1)
+
+        walk(tree, tree["name"], 0)
+        if current:
+            path = max(current)[2]  # deepest = the sprint, not the increment around it
+            return Choice(path, f"{path.split(chr(92))[-1]} (active)")
+        if upcoming:
+            path = min(upcoming, key=lambda u: (u[1], u[0]))[2]
+            return Choice(path, f"{path.split(chr(92))[-1]} (next)")
+        return None
+
     def create(
-        self,
-        title: str,
-        description_md: str,
-        issue_type: str,
-        acceptance_criteria_md: str = "",
-        extra_fields: dict | None = None,
-    ) -> str:
-        field = REPRO_STEPS if issue_type.lower() == "bug" else "System.Description"
-        fields = {"System.Title": title, field: _html(description_md)}
-        if acceptance_criteria_md and ACCEPTANCE in self._type_fields(issue_type):
-            fields[ACCEPTANCE] = _html(acceptance_criteria_md)
-        fields |= self.project.extra_fields | (extra_fields or {})
+        self, draft: Draft, profile: Profile, extra_fields: dict | None = None
+    ) -> Created:
+        d = draft.details
+        type_fields = self._type_fields(draft.issue_type)
+        field = REPRO_STEPS if draft.issue_type.lower() == "bug" else "System.Description"
+        fields = {"System.Title": draft.title, field: _html(draft.description)}
+        if draft.acceptance_criteria and ACCEPTANCE in type_fields:
+            fields[ACCEPTANCE] = _html(draft.acceptance_criteria)
         if self.project.assign_to_me:
             fields["System.AssignedTo"] = self.check()
-        ops = [
-            {"op": "add", "path": f"/fields/{k}", "value": v} for k, v in fields.items()
-        ]
-        item = self._req(
-            "POST",
-            f"/{self._proj()}/_apis/wit/workitems/${quote(issue_type)}",
-            json=ops,
-            headers={"Content-Type": "application/json-patch+json"},
-        )
-        return item["_links"]["html"]["href"]
 
+        details: dict = {}
+        if d.area:
+            details["System.AreaPath"] = d.area
+        if d.sprint:
+            details["System.IterationPath"] = d.sprint.value
+        if d.story_points is not None and STORY_POINTS in type_fields:
+            details[STORY_POINTS] = d.story_points
+        if d.priority and PRIORITY in type_fields:
+            details[PRIORITY] = int(d.priority)
+        relations = []
+        if d.parent:
+            relations.append({
+                "rel": "System.LinkTypes.Hierarchy-Reverse",
+                "url": f"{self.site.url}/_apis/wit/workItems/{d.parent.value}",
+            })
+        overrides = self.project.extra_fields | (extra_fields or {})
+
+        def post(with_details: bool) -> dict:
+            all_fields = fields | (details if with_details else {}) | overrides
+            ops = [{"op": "add", "path": f"/fields/{k}", "value": v} for k, v in all_fields.items()]
+            if with_details:
+                ops += [{"op": "add", "path": "/relations/-", "value": r} for r in relations]
+            return self._req(
+                "POST",
+                f"/{self._proj()}/_apis/wit/workitems/${quote(draft.issue_type)}",
+                json=ops,
+                headers={"Content-Type": "application/json-patch+json"},
+            )
+
+        warnings = []
+        try:
+            item = post(with_details=True)
+        except MissingFieldsError:
+            raise
+        except RuntimeError as e:
+            if not (details or relations):
+                raise
+            # A guessed detail was rejected (e.g. parent closed meanwhile); still create the ticket
+            item = post(with_details=False)
+            warnings.append(f"Created without parent/area/iteration/points/priority: {e}")
+        return Created(item["_links"]["html"]["href"], warnings)
 
 def _wiql_str(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"

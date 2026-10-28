@@ -10,6 +10,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "markdown>=3.6",
     "textual>=8.2.8",
+    "tomlkit>=0.15.2",
 ]
 
 [project.scripts]
