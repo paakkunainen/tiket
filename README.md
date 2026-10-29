@@ -39,3 +39,11 @@ Besides the text, `tiket` fills in the parent/epic, story points, priority, comp
 ## Ticket context for agents
 
 `tiket show <KEY|id|url>` collects one ticket in a single markdown document: the main fields (assignee, priority, parent, points, sprint, labels…), the description, acceptance criteria, linked tickets, subtasks and epic children, attachment links and every comment, oldest first. The site is found from the key's project (aliases first, then every Jira site; numeric ids go to Azure DevOps), or set it with `-i <alias|site>`. In `tiket tasks`, `c` copies the same document for the selected row. An agent can also run `tiket show KEY` itself.
+
+## Tests
+
+```
+uv run pytest
+```
+
+The suite never talks to a real tracker or Ollama: HTTP is mocked with respx, CLI tests use fake backends and a fake model, config and cache live in a temp dir, and opening a network socket fails the test.
