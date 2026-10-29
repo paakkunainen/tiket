@@ -404,6 +404,39 @@ class AzureDevOpsBackend:
             comments=self._comments(project, item["id"]),
         )
 
+    # --- adding to a ticket ----------------------------------------------------
+
+    def add_comment(self, ticket: Ticket, text: str) -> str:
+        self._req(
+            "POST",
+            f"/{quote(ticket.project)}/_apis/wit/workItems/{ticket.ref}/comments",
+            params={"api-version": "7.1-preview.4"},
+            json={"text": _html(text)},
+        )
+        return ticket.url
+
+    def append_description(self, ticket: Ticket, text: str) -> str:
+        item = self._req(
+            "GET",
+            f"/_apis/wit/workitems/{ticket.ref}",
+            params={"fields": f"System.WorkItemType,System.Description,{REPRO_STEPS}"},
+        )
+        f = item["fields"]
+        # Bugs show Repro Steps instead of Description, as in create()
+        field = REPRO_STEPS if f["System.WorkItemType"].lower() == "bug" else "System.Description"
+        ops = [
+            # fails instead of overwriting if someone saved the item in between
+            {"op": "test", "path": "/rev", "value": item["rev"]},
+            {"op": "add", "path": f"/fields/{field}", "value": (f.get(field) or "") + _html(text)},
+        ]
+        self._req(
+            "PATCH",
+            f"/_apis/wit/workitems/{ticket.ref}",
+            json=ops,
+            headers={"Content-Type": "application/json-patch+json"},
+        )
+        return ticket.url
+
     def _comments(self, project: str, wid: int) -> list[Comment]:
         comments: list[Comment] = []
         token = None

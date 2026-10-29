@@ -18,7 +18,7 @@ from rich.table import Table
 from . import aliases
 from . import details as ticket_details
 from . import llm, style_cache
-from .backends import Draft, Example, Item, MissingFieldsError, Profile, Ticket, make_backend
+from .backends import Backend, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update, make_backend
 from .clipboard import copy_to_clipboard, paste_from_clipboard
 from .config import ConfigError, Site, load_config, load_sites
 
@@ -40,6 +40,7 @@ tiket bf -p                                # long notes from the clipboard
 tiket                                      # pick project, then describe
 tiket tasks                                # browse your tickets, y = copy
 tiket show TIJOFI-5173 -c                  # copy ticket + comments
+tiket update BI-2314 -p                    # add notes as comment/description
 tiket alias                                # manage project aliases
 tiket doctor                               # check Ollama and credentials
 ```
@@ -71,7 +72,7 @@ TYPE_SYNONYMS |= {
     "tarina": TYPE_SYNONYMS["story"],
     "parannus": TYPE_SYNONYMS["improvement"],
 }
-SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "show", "alias", "config"}
+SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "show", "update", "alias", "config"}
 # Work item types that are never a sensible target or style example for a quick ticket
 IGNORED_TYPES = {
     "Test Case",
@@ -503,13 +504,151 @@ def show(
         console.print(Markdown(text))
 
 
+@app.command(
+    epilog="""**Examples**
+
+```
+tiket update BI-2314 "asiakas vahvisti: raportti ajetaan klo 6"
+tiket update BI-2314 -p          # the clipboard, e.g. pasted notes
+tiket update 258694 -d -p        # force: append to the description
+tiket update OPHJODTA-12 -c "…"  # force: comment
+tiket update BI-2314 "…" -n      # preview only
+```
+"""
+)
+def update(
+    ref: str = typer.Argument(
+        ..., help="Jira key (BI-123), Azure DevOps id (258694) or the ticket's URL"
+    ),
+    text: list[str] = typer.Argument(
+        None, help="The new information; `-` reads stdin; asked for if left out"
+    ),
+    paste: bool = typer.Option(
+        False, "--paste", "-p", help="Use the clipboard as the new information (after any text you give)"
+    ),
+    as_comment: bool = typer.Option(False, "--comment", "-c", help="Add it as a comment"),
+    as_description: bool = typer.Option(
+        False, "--description", "-d", help="Append it to the end of the description"
+    ),
+    where: str = typer.Option(
+        None, "--in", "-i", help="Alias or site to look in (see `tiket show -h`)"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview only, never write"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Write without asking"),
+):
+    """Add new information to an existing ticket, written by the model in the ticket's style.
+
+    The model reads the ticket and its comments, then writes the new information either as a
+    **comment** (progress, findings, decisions, questions) or as a section **appended to the
+    description** (new or corrected requirements, scope, specifications). It picks one and tells you
+    why; force it with **-c** / **-d**. The existing description is never rewritten.
+
+    Preview: **y** write · **r** rewrite (optionally with feedback) · **s** switch comment ↔
+    description · **e** edit in $EDITOR · **n** cancel.
+    """
+    if as_comment and as_description:
+        _die("Use either --comment or --description, not both")
+    target = "comment" if as_comment else "description" if as_description else None
+    cfg = load_config()
+    ticket, backend = _locate_ticket(ref, where)
+    info = _read_description(text or [], paste, prompt="New information for " + ticket.ref)
+    if not info:
+        _die("Nothing to add")
+    project = next(
+        (p for p in cfg.projects.values()
+         if p.site.name == backend.site.name and p.project.lower() == ticket.project.lower()),
+        None,
+    )
+    language = project.language if project else None
+
+    draft, feedback = None, None
+    while True:
+        with console.status(f"Writing with {cfg.ollama.model}…"):
+            draft = llm.write_update(
+                cfg.ollama, ticket, info, target, draft, feedback, language=language
+            )
+        _show_update(draft, ticket, chosen=target is None)
+        if dry_run:
+            return
+        if yes:
+            break
+        other = "description" if draft.target == "comment" else "comment"
+        choice = Prompt.ask(
+            f"[bold]Add {'comment' if draft.target == 'comment' else 'to description'}?[/] "
+            f"[green]y[/]es / [yellow]r[/]ewrite / [magenta]s[/]witch to {other} / [cyan]e[/]dit / [red]n[/]o",
+            choices=["y", "r", "s", "e", "n"],
+            default="y",
+            show_choices=False,
+        )
+        if choice == "y":
+            break
+        if choice == "n":
+            raise typer.Exit(1)
+        if choice == "e":
+            draft = Update(draft.target, _edit_text(draft.text), draft.reason)
+            _show_update(draft, ticket, chosen=False)
+            if Prompt.ask("[bold]Write edited text?[/]", choices=["y", "n"], default="y") == "y":
+                break
+            raise typer.Exit(1)
+        if choice == "s":
+            target, feedback = other, None
+            draft = None  # a comment and a description section are written differently
+            continue
+        feedback = Prompt.ask("Feedback for the rewrite (enter to skip)", default="") or None
+
+    with console.status(f"Updating {ticket.ref}…"):
+        if draft.target == "comment":
+            url = backend.add_comment(ticket, draft.text)
+        else:
+            url = backend.append_description(ticket, draft.text)
+    done = "Commented on" if draft.target == "comment" else "Added to the description of"
+    console.print(f"[bold green]{done}[/] {ticket.ref}: {url}")
+
+
+def _show_update(draft: Update, ticket: Ticket, chosen: bool) -> None:
+    title = (
+        f"Comment on {ticket.ref}" if draft.target == "comment"
+        else f"Append to the description of {ticket.ref}"
+    )
+    console.print(
+        Panel(
+            Markdown(draft.text),
+            title=f"[bold]{title}[/]",
+            subtitle=_clip_title(ticket.title),
+            expand=True,
+        )
+    )
+    if chosen and draft.reason:
+        console.print(f"[dim]Model chose {draft.target}: {draft.reason}[/]")
+
+
+def _clip_title(title: str, n: int = 60) -> str:
+    return title if len(title) <= n else title[: n - 1] + "…"
+
+
+def _edit_text(text: str) -> str:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as f:
+        f.write(text + "\n")
+        path = f.name
+    try:
+        subprocess.run(f'{editor} "{path}"', shell=True, check=True)
+        return open(path).read().strip()
+    finally:
+        os.unlink(path)
+
+
 def _ticket_summary(ticket: Ticket) -> tuple[str, str]:
     text = ticket.to_markdown()
     return text, f"{ticket.ref} {ticket.title} ({len(ticket.comments)} comments, {len(text):,} chars)"
 
 
 def _find_ticket(ref: str, where: str | None) -> Ticket:
-    """Resolve a key / id / URL to a ticket, trying the most likely sites first."""
+    return _locate_ticket(ref, where)[0]
+
+
+def _locate_ticket(ref: str, where: str | None) -> tuple[Ticket, Backend]:
+    """Resolve a key / id / URL to a ticket and its backend, trying the most likely sites first."""
     cfg = load_config()
     sites = load_sites()
     ref = ref.strip()
@@ -552,8 +691,9 @@ def _find_ticket(ref: str, where: str | None) -> Ticket:
     errors = []
     with console.status(f"Fetching {ref}…"):
         for site in candidates:
+            backend = make_backend(site)
             try:
-                return make_backend(site).ticket(ref)
+                return backend.ticket(ref), backend
             except LookupError:
                 continue
             except RuntimeError as e:
@@ -610,7 +750,7 @@ def doctor():
             console.print(f"[red]✗[/] {name:16} {e}")
 
 
-def _read_description(text: list[str], paste: bool) -> str:
+def _read_description(text: list[str], paste: bool, prompt: str = "Describe the problem") -> str:
     """Join the words given, stdin (`-` or a pipe) and the clipboard (-p); prompt if all are empty."""
     parts = []
     if text == ["-"]:
@@ -628,7 +768,7 @@ def _read_description(text: list[str], paste: bool) -> str:
         parts.append(_read_stdin())  # `pbpaste | tiket bf`
     if not parts:
         console.print(
-            "[bold]Describe the problem[/] [dim](paste or type; end with Ctrl-D on an empty line)[/]"
+            f"[bold]{prompt}[/] [dim](paste or type; end with Ctrl-D on an empty line)[/]"
         )
         parts.append(sys.stdin.read())
     return "\n\n".join(p.strip() for p in parts if p.strip())

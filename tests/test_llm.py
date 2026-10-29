@@ -163,3 +163,66 @@ def test_ollama_errors(settings, cloud_project):
     respx.post(OLLAMA).mock(return_value=httpx.Response(500, text="model not found"))
     with pytest.raises(RuntimeError, match="Ollama error 500: model not found"):
         llm.generate(settings, cloud_project, EN, ["Task"], "x")
+
+
+# --- write_update ---------------------------------------------------------------
+
+def a_ticket(**kw):
+    from tiket.backends import Comment, Ticket
+
+    return Ticket(
+        "BI-5", "Raportti kaatuu", "https://t/BI-5", "Task", "Open", "BI",
+        description=kw.pop("description", "Kun raportti ajetaan yöllä, se kaatuu ja on hidas"),
+        comments=kw.pop("comments", [Comment("Ann", "2026-01-01T00:00", "Tarkistin lokit")]),
+    )
+
+
+@respx.mock
+def test_write_update_lets_model_choose(settings):
+    route = respx.post(OLLAMA).mock(
+        return_value=reply({"target": "description", "text": " ### Lisätiedot\n- x ", "reason": "new scope"})
+    )
+    update = llm.write_update(settings, a_ticket(), "customer wants csv too")
+    assert (update.target, update.text, update.reason) == ("description", "### Lisätiedot\n- x", "new scope")
+    sent = json.loads(route.calls.last.request.content)
+    system, user = sent["messages"][0]["content"], sent["messages"][1]["content"]
+    assert "# BI-5: Raportti kaatuu" in system and "Tarkistin lokit" in system  # the whole ticket
+    assert "Write in Finnish" in system  # detected from the ticket text
+    assert "target must be" not in system
+    assert "customer wants csv too" in user
+    assert sent["format"]["properties"]["target"]["enum"] == ["comment", "description"]
+
+
+@respx.mock
+def test_write_update_forced_target_and_language(settings):
+    route = respx.post(OLLAMA).mock(return_value=reply({"target": "comment", "text": "t", "reason": ""}))
+    update = llm.write_update(settings, a_ticket(), "x", target="description", language="English")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["format"]["properties"]["target"]["enum"] == ["description"]
+    assert 'target must be "description"' in sent["messages"][0]["content"]
+    assert "Write in English" in sent["messages"][0]["content"]
+    assert update.target == "description"  # an off-list answer falls back to the forced target
+
+
+@respx.mock
+def test_write_update_rewrite_sends_previous_and_feedback(settings):
+    from tiket.backends import Update
+
+    route = respx.post(OLLAMA).mock(return_value=reply({"target": "comment", "text": "t2", "reason": "r"}))
+    llm.write_update(settings, a_ticket(), "x", previous=Update("comment", "t1", "r"), feedback="shorter")
+    sent = json.loads(route.calls.last.request.content)
+    assert json.loads(sent["messages"][2]["content"]) == {"target": "comment", "text": "t1", "reason": "r"}
+    assert sent["messages"][3]["content"] == "Rewrite the addition. shorter"
+    assert sent["options"]["temperature"] == 0.6
+
+
+def test_long_ticket_context_drops_oldest_comments_first(monkeypatch):
+    from tiket.backends import Comment
+
+    monkeypatch.setattr(llm, "TICKET_CHARS", 400)
+    comments = [Comment("A", "2026-01-0%dT00:00" % i, f"comment {i} " + "x" * 80) for i in range(1, 6)]
+    text = llm._ticket_context(a_ticket(comments=comments))
+    assert len(text) <= 400
+    assert "comment 5" in text and "comment 1" not in text
+    assert "## Description" in text
+    assert len(llm._ticket_context(a_ticket(description="y" * 1000, comments=[]))) == 400

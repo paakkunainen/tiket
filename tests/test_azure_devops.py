@@ -437,3 +437,49 @@ def test_ticket_not_found(ado):
     respx.get(f"{ORG}/_apis/wit/workitems/8").respond(500, text="down")
     with pytest.raises(RuntimeError, match="500"):
         ado.ticket("8")
+
+
+# --- adding to a ticket -------------------------------------------------------
+
+def ado_ticket():
+    from tiket.backends import Ticket
+
+    return Ticket("42", "t", f"{ORG}/Esko%20Two/_workitems/edit/42", "User Story", "New", "Esko Two")
+
+
+@respx.mock
+def test_add_comment_posts_html_to_the_items_project(ado):
+    route = respx.post(f"{ORG}/Esko%20Two/_apis/wit/workItems/42/comments").respond(json={"id": 1})
+    assert ado.add_comment(ado_ticket(), "**Valmis**") == f"{ORG}/Esko%20Two/_workitems/edit/42"
+    request = route.calls.last.request
+    assert body(request) == {"text": "<p><strong>Valmis</strong></p>"}
+    assert request.url.params["api-version"] == "7.1-preview.4"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "item_type, field", [("User Story", "System.Description"), ("Bug", REPRO_STEPS)]
+)
+def test_append_description_adds_html_to_the_shown_field(ado, item_type, field):
+    respx.get(f"{ORG}/_apis/wit/workitems/42").respond(
+        json={"id": 42, "rev": 7, "fields": {"System.WorkItemType": item_type, field: "<div>Old</div>"}}
+    )
+    patch = respx.patch(f"{ORG}/_apis/wit/workitems/42").respond(json={"id": 42})
+    ado.append_description(ado_ticket(), "## Update\n\n| a | b |\n|---|---|\n| 1 | 2 |")
+    request = patch.calls.last.request
+    assert request.headers["Content-Type"] == "application/json-patch+json"
+    test, add = body(request)
+    assert test == {"op": "test", "path": "/rev", "value": 7}  # refuses to overwrite a newer save
+    assert add["path"] == f"/fields/{field}"
+    assert add["value"].startswith("<div>Old</div><h2>Update</h2>")
+    assert "<td>1</td>" in add["value"]
+
+
+@respx.mock
+def test_append_description_to_empty_field(ado):
+    respx.get(f"{ORG}/_apis/wit/workitems/42").respond(
+        json={"id": 42, "rev": 1, "fields": {"System.WorkItemType": "Task"}}
+    )
+    patch = respx.patch(f"{ORG}/_apis/wit/workitems/42").respond(json={"id": 42})
+    ado.append_description(ado_ticket(), "new")
+    assert body(patch.calls.last.request)[1]["value"] == "<p>new</p>"

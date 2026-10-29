@@ -6,7 +6,7 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
-from fakes import FakeBackend, FakeModel
+from fakes import FakeBackend, FakeModel, FakeUpdateModel
 from tiket import cli
 from tiket.backends import Choice, Comment, Details, Draft, Example, Item, Ticket
 from tiket.config import ConfigError
@@ -507,6 +507,107 @@ def test_show_reports_site_errors(shown):
 def test_show_rejects_garbage(shown):
     result = run("show", "hello")
     assert result.exit_code == 2 and "doesn't look like a Jira key" in result.output
+
+
+# --- update -------------------------------------------------------------------
+
+@pytest.fixture
+def writer(shown, monkeypatch) -> FakeUpdateModel:
+    fake = FakeUpdateModel()
+    monkeypatch.setattr(cli.llm, "write_update", fake)
+    return fake
+
+
+def test_update_model_chooses_comment(shown, writer):
+    result = run("update", "BI-5", "asiakas", "vahvisti", input="y\n")
+    assert result.exit_code == 0, result.output
+    assert writer.calls[0]["info"] == "asiakas vahvisti"
+    assert writer.calls[0]["target"] is None and writer.calls[0]["ticket"] is TICKET
+    assert "Comment on BI-5" in result.output and "Model chose comment: because" in result.output
+    assert shown.updates == [("comment", "BI-5", "comment text 1")]
+    assert "Commented on BI-5: https://cloud.test/browse/BI-5?focusedCommentId=7" in result.output
+
+
+def test_update_forced_description(shown, writer):
+    result = run("update", "BI-5", "-d", "new scope", "-y")
+    assert result.exit_code == 0, result.output
+    assert writer.calls[0]["target"] == "description"
+    assert "Model chose" not in result.output  # nothing was chosen by the model
+    assert shown.updates == [("description", "BI-5", "description text 1")]
+    assert "Added to the description of BI-5" in result.output
+
+
+def test_update_forced_comment_and_both_flags(shown, writer):
+    run("update", "BI-5", "-c", "x", "-y")
+    assert writer.calls[0]["target"] == "comment"
+    result = run("update", "BI-5", "-c", "-d", "x")
+    assert result.exit_code == 2 and "either --comment or --description" in result.output
+
+
+def test_update_switch_target_regenerates(shown, writer):
+    result = run("update", "BI-5", "x", input="s\ny\n")
+    assert result.exit_code == 0, result.output
+    assert [c["target"] for c in writer.calls] == [None, "description"]
+    assert writer.calls[1]["previous"] is None
+    assert shown.updates == [("description", "BI-5", "description text 2")]
+
+
+def test_update_rewrite_with_feedback(shown, writer):
+    run("update", "BI-5", "x", input="r\nshorter\ny\n")
+    assert writer.calls[1]["feedback"] == "shorter"
+    assert writer.calls[1]["previous"].text == "comment text 1"
+    assert shown.updates == [("comment", "BI-5", "comment text 2")]
+
+
+def test_update_edit(shown, writer, tmp_path, monkeypatch):
+    script = tmp_path / "ed.py"
+    script.write_text("import sys, pathlib\npathlib.Path(sys.argv[1]).write_text('edited by hand\\n')\n")
+    monkeypatch.setenv("EDITOR", f"{sys.executable} {script}")
+    monkeypatch.delenv("VISUAL", raising=False)
+    result = run("update", "BI-5", "x", input="e\ny\n")
+    assert result.exit_code == 0, result.output
+    assert shown.updates == [("comment", "BI-5", "edited by hand")]
+    shown.updates.clear()
+    assert run("update", "BI-5", "x", input="e\nn\n").exit_code == 1
+    assert shown.updates == []
+
+
+def test_update_cancel_and_dry_run_write_nothing(shown, writer):
+    assert run("update", "BI-5", "x", input="n\n").exit_code == 1
+    result = run("update", "BI-5", "x", "-n")
+    assert result.exit_code == 0 and "Comment on BI-5" in result.output
+    assert shown.updates == []
+
+
+def test_update_reads_clipboard_and_needs_some_text(shown, writer, monkeypatch):
+    monkeypatch.setattr(cli, "paste_from_clipboard", lambda: "line 1\nline 2\n")
+    run("update", "BI-5", "-p", "-n")
+    assert writer.calls[0]["info"] == "line 1\nline 2"
+    result = run("update", "BI-5", input="")
+    assert result.exit_code == 2 and "Nothing to add" in result.output
+
+
+def test_update_uses_language_of_matching_alias(shown, writer, config_file):
+    config_file.write_text(config_file.read_text().replace("# Business Finland\n", '# Business Finland\nlanguage = "Finnish"\n'))
+    run("update", "BI-5", "x", "-n")
+    assert writer.calls[0]["language"] == "Finnish"
+    shown.tickets = {"ZZ-1": TICKET.__class__(**{**TICKET.to_dict(), "comments": [], "project": "ZZ"})}
+    run("update", "ZZ-1", "x", "-n")
+    assert writer.calls[1]["language"] is None  # no alias for ZZ: the model detects it
+
+
+def test_update_unknown_ticket(shown, writer):
+    shown.tickets = {}
+    result = run("update", "BI-404", "x")
+    assert result.exit_code == 2 and "not found" in result.output
+    assert writer.calls == []
+
+
+def test_update_is_a_subcommand_not_an_alias(shown, writer, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["tiket", "update", "BI-5", "x", "-n"])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 0 and writer.calls
 
 
 # --- other commands -----------------------------------------------------------

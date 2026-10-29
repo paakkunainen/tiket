@@ -1,13 +1,15 @@
+import dataclasses
 import json
 import re
 
 import httpx
 
 from . import details as ticket_details
-from .backends import Choice, Draft, Example, Profile
+from .backends import Choice, Draft, Example, Profile, Ticket, Update
 from .config import OllamaSettings, Project
 
 EXAMPLE_CHARS = 800
+TICKET_CHARS = 24_000  # ticket context for updates; oldest comments are dropped first
 
 SYSTEM = """You write tickets for the issue tracker project "{project}".
 Turn the user's description (a few words or longer pasted notes) into a ticket that looks like it was
@@ -36,6 +38,90 @@ AC_RULE = """- acceptance_criteria: this tracker has a separate Acceptance Crite
   list, same language and style as the examples' acceptance criteria) for every type except Bug; keep it to
   what the user's description actually implies. Do not repeat it in the description.
 """
+
+
+UPDATE_SYSTEM = """You add new information to an existing ticket in an issue tracker.
+
+=== The ticket, with its comments ===
+{ticket}
+=== End of ticket ===
+
+How to write the addition:
+- Write in {language}, in the tone and style of this ticket and its comments.
+- Use ONLY facts from the new information. Do not repeat what the ticket already says.
+- Keep every new fact, name, number, list item and table row; do not summarise detail away.
+  Keep tables as Markdown tables and identifiers as `code`. Markdown is converted afterwards.
+- target "description" when the information changes or completes what the ticket asks for: new or
+  corrected requirements, scope, acceptance criteria, specifications, reference tables. Then write a
+  section that is appended to the END of the description: a heading in the style of the description's
+  own headings (e.g. "Lisätiedot", "Update"), then the content. Never rewrite the existing description.
+- target "comment" for progress, findings, decisions, questions, status or discussion. Write it as the
+  user's own comment: no heading, no greeting, no sign-off.
+- reason: one short English sentence on why this target fits.
+{target_rule}"""
+
+
+def write_update(
+    settings: OllamaSettings,
+    ticket: Ticket,
+    info: str,
+    target: str | None = None,
+    previous: Update | None = None,
+    feedback: str | None = None,
+    language: str | None = None,
+) -> Update:
+    """Turn new information into a comment or a description section for an existing ticket.
+
+    target forces "comment" or "description"; None lets the model choose."""
+    language = language or settings.language
+    if language == "auto":
+        texts = [ticket.description, *(c.body for c in ticket.comments)]
+        language = detect_language([Example(ticket.title, "", "\n".join(texts))])
+    targets = [target] if target else ["comment", "description"]
+    target_rule = f'- target must be "{target}".\n' if target else ""
+    messages = [
+        {
+            "role": "system",
+            "content": UPDATE_SYSTEM.format(
+                ticket=_ticket_context(ticket), language=language, target_rule=target_rule
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"New information for {ticket.ref}:\n{info}\n\nWrite the addition in {language}.",
+        },
+    ]
+    if previous:
+        messages.append(
+            {"role": "assistant", "content": json.dumps(dataclasses.asdict(previous), ensure_ascii=False)}
+        )
+        messages.append(
+            {"role": "user", "content": "Rewrite the addition. " + (feedback or "Try a different wording.")}
+        )
+    schema = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "enum": targets},
+            "text": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["target", "text", "reason"],
+    }
+    data = _chat(settings, messages, schema, temperature=0.3 if not previous else 0.6)
+    return Update(
+        target=data.get("target") if data.get("target") in targets else targets[0],
+        text=data["text"].strip(),
+        reason=(data.get("reason") or "").strip(),
+    )
+
+
+def _ticket_context(ticket: Ticket) -> str:
+    comments = list(ticket.comments)
+    text = ticket.to_markdown()
+    while len(text) > TICKET_CHARS and comments:
+        comments.pop(0)
+        text = dataclasses.replace(ticket, comments=comments).to_markdown()
+    return text[:TICKET_CHARS]
 
 
 def _format_examples(examples: list[Example]) -> str:
@@ -150,12 +236,24 @@ def generate(
     detail_props = ticket_details.schema_properties(profile)
     schema["properties"] |= detail_props
     schema["required"] += list(detail_props)
+    data = _chat(settings, messages, schema, temperature=0.3 if not previous else 0.6)
+    issue_type = data.get("issue_type") if data.get("issue_type") in types else types[0]
+    return Draft(
+        title=data["title"].strip(),
+        description=data["description"].strip(),
+        issue_type=issue_type,
+        acceptance_criteria=(data.get("acceptance_criteria") or "").strip(),
+        details=ticket_details.from_model(data, profile, sprint),
+    )
+
+
+def _chat(settings: OllamaSettings, messages: list[dict], schema: dict, temperature: float) -> dict:
     payload = {
         "model": settings.model,
         "messages": messages,
         "stream": False,
         "format": schema,
-        "options": {"temperature": 0.3 if not previous else 0.6, "num_ctx": 16384},
+        "options": {"temperature": temperature, "num_ctx": 16384},
     }
     if settings.think:
         payload["think"] = settings.think
@@ -170,16 +268,7 @@ def generate(
         )
     if r.is_error:
         raise RuntimeError(f"Ollama error {r.status_code}: {r.text[:500]}")
-    content = r.json()["message"]["content"]
-    data = _parse_json(content)
-    issue_type = data.get("issue_type") if data.get("issue_type") in types else types[0]
-    return Draft(
-        title=data["title"].strip(),
-        description=data["description"].strip(),
-        issue_type=issue_type,
-        acceptance_criteria=(data.get("acceptance_criteria") or "").strip(),
-        details=ticket_details.from_model(data, profile, sprint),
-    )
+    return _parse_json(r.json()["message"]["content"])
 
 
 def _parse_json(content: str) -> dict:

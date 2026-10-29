@@ -582,3 +582,44 @@ def test_create_defers_on_either_jira_wording(cloud, message):
     created = cloud.create(Draft("T", "D", "Task", details=Details(story_points=5.0)), PROFILE)
     assert body(put.calls.last.request) == {"fields": {"customfield_10036": 5.0}}
     assert created.warnings == []
+
+
+# --- adding to a ticket -------------------------------------------------------
+
+def jira_ticket(url=f"{CLOUD}/browse/BI-5"):
+    from tiket.backends import Ticket
+
+    return Ticket("BI-5", "t", url, "Task", "Open", "BI")
+
+
+@respx.mock
+def test_add_comment_posts_wiki_markup(cloud):
+    route = respx.post(f"{CLOUD}/rest/api/2/issue/BI-5/comment").respond(201, json={"id": "10042"})
+    url = cloud.add_comment(jira_ticket(), "**Done**\n\n- `x`")
+    assert body(route.calls.last.request) == {"body": "*Done*\n\n* {{x}}"}
+    assert url == f"{CLOUD}/browse/BI-5?focusedCommentId=10042"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "current, expected",
+    [
+        ("h3. Tausta\nVanha {color:red}teksti{color}\n\n", "h3. Tausta\nVanha {color:red}teksti{color}\n\nh3. Lisätiedot\n* uusi"),
+        (None, "h3. Lisätiedot\n* uusi"),
+        ("  \n", "h3. Lisätiedot\n* uusi"),
+    ],
+)
+def test_append_description_keeps_existing_wiki_markup(dc, current, expected):
+    get = respx.get(f"{DC}/rest/api/2/issue/BI-5").respond(json={"fields": {"description": current}})
+    put = respx.put(f"{DC}/rest/api/2/issue/BI-5").respond(204)
+    assert dc.append_description(jira_ticket(f"{DC}/browse/BI-5"), "### Lisätiedot\n- uusi") == f"{DC}/browse/BI-5"
+    assert get.calls.last.request.url.params["fields"] == "description"
+    assert body(put.calls.last.request) == {"fields": {"description": expected}}
+
+
+@respx.mock
+def test_append_description_errors_are_raised(cloud):
+    respx.get(f"{CLOUD}/rest/api/2/issue/BI-5").respond(json={"fields": {"description": "x"}})
+    respx.put(f"{CLOUD}/rest/api/2/issue/BI-5").respond(403, text="no edit permission")
+    with pytest.raises(RuntimeError, match="403: no edit permission"):
+        cloud.append_description(jira_ticket(), "y")

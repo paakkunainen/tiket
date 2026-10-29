@@ -12,6 +12,7 @@ from .base import (
     MissingFieldsError,
     Profile,
     Ticket,
+    Update,
 )
 from .jira import JiraBackend
 
@@ -38,5 +39,6 @@ __all__ = [
     "MissingFieldsError",
     "Profile",
     "Ticket",
+    "Update",
     "make_backend",
 ]

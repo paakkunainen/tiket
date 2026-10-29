@@ -24,6 +24,9 @@ tiket tasks digifinland -a                   # include done/closed tickets
 tiket show TIJOFI-5173                       # one ticket in full: fields, description, links, comments
 tiket show TIJOFI-5173 -c                    # …copied as markdown, e.g. as context for an agent
 tiket show 258694 > ticket.md                # piped = plain markdown; --json for JSON; URLs work too
+tiket update BI-2314 "new info"              # add to a ticket: the model writes a comment or a
+                                             # section appended to the description (-c / -d force)
+tiket update BI-2314 -p                      # …from the clipboard; preview y/r/s(witch)/e/n
 tiket alias                                  # list aliases; add / rename / set / remove (see -h)
 tiket alias add jod eduuni OPHJOD            # checks the project exists, shows its issue types
 tiket alias rename tijo omaolo
@@ -42,6 +45,15 @@ Besides the text, `tiket` fills in the parent/epic, story points, priority, comp
 ## Ticket context for agents
 
 `tiket show <KEY|id|url>` collects one ticket in a single markdown document: the main fields (assignee, priority, parent, points, sprint, labels…), the description, acceptance criteria, linked tickets, subtasks and epic children, attachment links and every comment, oldest first. The site is found from the key's project (aliases first, then every Jira site; numeric ids go to Azure DevOps), or set it with `-i <alias|site>`. In `tiket tasks`, `c` copies the same document for the selected row. An agent can also run `tiket show KEY` itself.
+
+## Adding to an existing ticket
+
+`tiket update <key|id|url> "…"` (or `-p` for the clipboard) reads the ticket and its comments, and the model writes the new information in the ticket's language and style. It decides where it belongs and says why:
+
+- **comment**: progress, findings, decisions, questions, status.
+- **description**: new or corrected requirements, scope, specifications, reference tables. This is added as a new section at the **end** of the description. The existing text is never rewritten: Jira gets back its original wiki markup exactly, and Azure DevOps refuses the save if someone else edited the item in the meantime.
+
+Press `s` in the preview to switch between the two, or force one with `-c` / `-d`.
 
 ## Tests
 

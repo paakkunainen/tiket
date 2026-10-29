@@ -484,6 +484,23 @@ class JiraBackend:
             comments=self._comments(issue["key"]),
         )
 
+    # --- adding to a ticket ----------------------------------------------------
+
+    def add_comment(self, ticket: Ticket, text: str) -> str:
+        comment = self._req(
+            "POST", f"/rest/api/2/issue/{ticket.ref}/comment", json={"body": md_to_jira(text)}
+        )
+        return f"{ticket.url}?focusedCommentId={comment['id']}"
+
+    def append_description(self, ticket: Ticket, text: str) -> str:
+        # v2 returns the raw wiki markup, so the existing text goes back exactly as it was
+        current = self._req(
+            "GET", f"/rest/api/2/issue/{ticket.ref}", params={"fields": "description"}
+        )["fields"].get("description") or ""
+        description = (current.rstrip() + "\n\n" if current.strip() else "") + md_to_jira(text)
+        self._req("PUT", f"/rest/api/2/issue/{ticket.ref}", json={"fields": {"description": description}})
+        return ticket.url
+
     def _issue_label(self, key: str) -> str:
         try:
             issues = self._search(f"key = {key}", 1, ["summary"])

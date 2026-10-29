@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from tiket.backends import Choice, Created, Draft, Example, Item, MissingFieldsError, Profile, Ticket
+from tiket.backends import Choice, Created, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update
 
 
 @dataclass
@@ -21,6 +21,7 @@ class FakeBackend:
     fail: Exception | None = None
     created: list[tuple[Draft, dict]] = field(default_factory=list)
     calls: list = field(default_factory=list)
+    updates: list[tuple[str, str, str]] = field(default_factory=list)  # (target, ref, text)
 
     def check(self):
         if self.fail:
@@ -68,6 +69,29 @@ class FakeBackend:
         if ref not in self.tickets:
             raise LookupError(f"{ref} not found")
         return self.tickets[ref]
+
+
+    def add_comment(self, ticket, text):
+        self.updates.append(("comment", ticket.ref, text))
+        return f"{ticket.url}?focusedCommentId=7"
+
+    def append_description(self, ticket, text):
+        self.updates.append(("description", ticket.ref, text))
+        return ticket.url
+
+
+class FakeUpdateModel:
+    """Replaces llm.write_update; picks `choose` unless a target is forced."""
+
+    def __init__(self, choose="comment"):
+        self.choose = choose
+        self.calls: list[dict] = []
+
+    def __call__(self, settings, ticket, info, target=None, previous=None, feedback=None, language=None):
+        self.calls.append(dict(ticket=ticket, info=info, target=target, previous=previous,
+                               feedback=feedback, language=language))
+        chosen = target or self.choose
+        return Update(chosen, f"{chosen} text {len(self.calls)}", "because")
 
 
 class FakeModel:

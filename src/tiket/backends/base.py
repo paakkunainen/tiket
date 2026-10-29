@@ -93,6 +93,15 @@ class Created:
 
 
 @dataclass
+class Update:
+    """New information for an existing ticket, as a comment or a section appended to the description."""
+
+    target: str  # "comment" | "description"
+    text: str  # markdown
+    reason: str = ""  # why the model picked the target
+
+
+@dataclass
 class Comment:
     author: str
     created: str  # ISO timestamp
@@ -201,6 +210,12 @@ class Backend(Protocol):
 
     def ticket(self, ref: str) -> Ticket:
         """Full ticket with description, fields, links and all comments; raises LookupError if not found."""
+
+    def add_comment(self, ticket: Ticket, text: str) -> str:
+        """Post a markdown comment; returns a URL to it."""
+
+    def append_description(self, ticket: Ticket, text: str) -> str:
+        """Append markdown to the end of the description, leaving the existing text untouched; returns the URL."""
 
 
 def rank(values: list[tuple[str, str]]) -> list[Choice]:
