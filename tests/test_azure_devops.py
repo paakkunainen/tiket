@@ -278,11 +278,11 @@ def test_create_user_story(ado):
     mock_type_fields()
     mock_connection()
     post = respx.post(f"{ORG}/Esko/_apis/wit/workitems/$User%20Story").respond(
-        json={"_links": {"html": {"href": f"{ORG}/Esko/_workitems/edit/1"}}}
+        json={"id": 1, "_links": {"html": {"href": f"{ORG}/Esko/_workitems/edit/1"}}}
     )
     created = ado.create(Draft("Title", "**Desc**", "User Story", "- works", DETAILS), Profile(), {"Custom.X": "y"})
 
-    assert created.url == f"{ORG}/Esko/_workitems/edit/1" and created.warnings == []
+    assert created.url == f"{ORG}/Esko/_workitems/edit/1" and created.warnings == [] and created.ref == "1"
     request = post.calls.last.request
     assert request.headers["Content-Type"] == "application/json-patch+json"
     ops = ops_dict(request)
@@ -307,7 +307,7 @@ def test_create_user_story(ado):
 def test_create_bug_uses_repro_steps_and_skips_missing_fields(ado):
     ado.project.assign_to_me = False
     mock_type_fields("Bug", ["System.Title", REPRO_STEPS])
-    post = respx.post(f"{ORG}/Esko/_apis/wit/workitems/$Bug").respond(json={"_links": {"html": {"href": "u"}}})
+    post = respx.post(f"{ORG}/Esko/_apis/wit/workitems/$Bug").respond(json={"id": 2, "_links": {"html": {"href": "u"}}})
     ado.create(Draft("T", "Steps", "Bug", "- ignored", Details(story_points=1.0, priority="2")), Profile())
     ops = ops_dict(post.calls.last.request)
     assert ops == {"/fields/System.Title": "T", f"/fields/{REPRO_STEPS}": "<p>Steps</p>"}
@@ -319,7 +319,7 @@ def test_create_retries_without_rejected_details(ado):
     mock_type_fields()
     post = respx.post(f"{ORG}/Esko/_apis/wit/workitems/$User%20Story").mock(side_effect=[
         httpx.Response(400, json={"message": "TF401347: Invalid tree name given for work item -1, field 'System.IterationPath'."}),
-        httpx.Response(200, json={"_links": {"html": {"href": "u"}}}),
+        httpx.Response(200, json={"id": 2, "_links": {"html": {"href": "u"}}}),
     ])
     created = ado.create(Draft("T", "D", "User Story", details=DETAILS), Profile())
     retry = ops_dict(post.calls[1].request)

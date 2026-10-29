@@ -322,7 +322,7 @@ def test_create_cloud_sends_everything(cloud):
 
     created = cloud.create(draft, PROFILE, {"customfield_1": "x"})
 
-    assert created.url == f"{CLOUD}/browse/BI-100" and created.warnings == []
+    assert created.url == f"{CLOUD}/browse/BI-100" and created.warnings == [] and created.ref == "BI-100"
     fields = body(post.calls.last.request)["fields"]
     assert fields == {
         "project": {"key": "BI"},

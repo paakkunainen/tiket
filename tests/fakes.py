@@ -60,7 +60,7 @@ class FakeBackend:
         if missing:
             raise MissingFieldsError(missing, "required")
         self.created.append((draft, extra))
-        return Created("https://tracker.test/BI-100", ["Could not set x"])
+        return Created("https://tracker.test/BI-100", ["Could not set x"], "BI-100")
 
     def ticket(self, ref):
         self.calls.append(("ticket", ref))

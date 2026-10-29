@@ -1,4 +1,6 @@
+import dataclasses
 import difflib
+import functools
 import json
 import os
 import re
@@ -7,6 +9,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -18,7 +21,7 @@ from rich.table import Table
 from . import aliases
 from . import details as ticket_details
 from . import llm, style_cache
-from .backends import Backend, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update, make_backend
+from .backends import Backend, Details, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update, make_backend
 from .clipboard import copy_to_clipboard, paste_from_clipboard
 from .config import ConfigError, Site, load_config, load_sites
 
@@ -89,6 +92,24 @@ IGNORED_TYPES = {
 }
 
 
+def _json_aware(command):
+    """With --json, everything but the JSON itself goes to stderr."""
+
+    @functools.wraps(command)
+    def run(*args, **kwargs):
+        if not kwargs.get("as_json"):
+            return command(*args, **kwargs)
+        # Console() without a file follows whatever sys.stdout is at print time; keep that
+        stdout = console._file
+        console.file = sys.stderr
+        try:
+            return command(*args, **kwargs)
+        finally:
+            console._file = stdout
+
+    return run
+
+
 @app.command(
     epilog="""**Examples**
 
@@ -101,9 +122,12 @@ tiket edu "…" -r                               # re-read recent tickets
 tiket bf -p                                    # clipboard as description
 tiket bf "summary line" -p                     # short note + clipboard
 pbpaste | tiket bf -                           # description from stdin
+tiket new bf "…" -n --save d.json              # preview, keep the draft
+tiket new --from d.json -y --json              # create exactly that draft
 ```
 """
 )
+@_json_aware
 def new(
     alias: str = typer.Argument(
         None, help="Project alias from config (omit for a picker)"
@@ -142,6 +166,15 @@ def new(
         "-D",
         help="Don't guess parent, story points, priority, components, labels or sprint",
     ),
+    save: Path = typer.Option(
+        None, "--save", help="Write the draft to this JSON file (edit it, then create it with --from)"
+    ),
+    load: Path = typer.Option(
+        None, "--from", help="Use the draft saved with --save instead of writing a new one"
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the result (or the draft, with -n) as JSON; messages go to stderr"
+    ),
 ):
     """Create a ticket from a short description.
 
@@ -152,20 +185,31 @@ def new(
 
     You get a preview first: **y** create · **r** rewrite (optionally with feedback such as
     "shorter") · **e** edit everything in $EDITOR, where `none` clears a detail · **n** cancel.
+
+    For scripts and agents: **-n --save d.json** previews and keeps the draft, **--from d.json -y**
+    creates exactly that draft, and **--json** prints machine-readable output.
     """
     cfg = load_config()
     if not cfg.projects:
         _die(f"No projects configured in {cfg.path}")
 
+    saved = _load_saved(load, "new") if load else None
+    if saved:
+        if alias and alias != saved["alias"]:
+            _die(f"{load} is a draft for '{saved['alias']}', not '{alias}'")
+        alias = saved["alias"]
+        if alias not in cfg.projects:
+            _die(f"Unknown alias '{alias}' in {load}. Configured: {', '.join(cfg.projects)}")
     if alias is None:
         alias = _pick_alias(cfg.projects)
     elif alias not in cfg.projects:
         _die(f"Unknown alias '{alias}'. Configured: {', '.join(cfg.projects)}")
     project = cfg.projects[alias]
 
-    user_text = _read_description(text or [], paste)
+    user_text = saved["input"] if saved else _read_description(text or [], paste)
     if not user_text:
         _die("Empty description")
+    loaded = Draft.from_dict(saved["draft"]) if saved else None
 
     backend = make_backend(project.site, project)
     with console.status(f"Fetching recent tickets from {project.project}…"):
@@ -177,9 +221,13 @@ def new(
         if project.guess_details and not no_details:
             profile = style_cache.get_profile(project, backend, refresh=refresh)
             sprint = backend.current_sprint(profile)
+        elif loaded and loaded.details != Details():
+            profile = style_cache.get_profile(project, backend)  # field ids for the saved details
     examples = [e for e in examples if e.issue_type not in IGNORED_TYPES]
 
-    if issue_type:
+    if loaded:
+        types = [loaded.issue_type]
+    elif issue_type:
         types = [_resolve_type(issue_type, creatable)]
     elif project.types:
         types = project.types
@@ -196,22 +244,29 @@ def new(
 
     draft, feedback = None, None
     while True:
-        with console.status(f"Writing ticket with {cfg.ollama.model}…"):
-            draft = llm.generate(
-                cfg.ollama,
-                project,
-                examples,
-                types,
-                user_text,
-                draft,
-                feedback,
-                ac_field=backend.separate_acceptance_criteria,
-                profile=profile,
-                sprint=sprint,
-            )
+        if loaded:
+            draft, loaded = loaded, None
+        else:
+            with console.status(f"Writing ticket with {cfg.ollama.model}…"):
+                draft = llm.generate(
+                    cfg.ollama,
+                    project,
+                    examples,
+                    types,
+                    user_text,
+                    draft,
+                    feedback,
+                    ac_field=backend.separate_acceptance_criteria,
+                    profile=profile,
+                    sprint=sprint,
+                )
         _show(draft, project)
         _warn_duplicates(draft, examples)
+        state = {"command": "new", "alias": alias, "input": user_text, "draft": draft.to_dict()}
+        _save(save, state)
         if dry_run:
+            if as_json:
+                _print_json(state)
             return
         if yes:
             break
@@ -228,6 +283,7 @@ def new(
         if choice == "e":
             draft = _edit(draft)
             _show(draft, project)
+            _save(save, {**state, "draft": draft.to_dict()})
             if (
                 Prompt.ask(
                     "[bold]Create edited ticket?[/]", choices=["y", "n"], default="y"
@@ -258,6 +314,9 @@ def new(
                 if not value:
                     raise typer.Exit(1)
                 extra[ref] = _parse_value(value)
+    if as_json:
+        _print_json({"ref": created.ref, "url": created.url, "warnings": created.warnings})
+        return
     console.print(f"[bold green]Created:[/] {created.url}")
     for warning in created.warnings:
         console.print(f"[yellow]⚠ {warning}[/]")
@@ -513,12 +572,15 @@ tiket update BI-2314 -p          # the clipboard, e.g. pasted notes
 tiket update 258694 -d -p        # force: append to the description
 tiket update OPHJODTA-12 -c "…"  # force: comment
 tiket update BI-2314 "…" -n      # preview only
+tiket update BI-2314 "…" -n --save u.json
+tiket update --from u.json -y --json
 ```
 """
 )
+@_json_aware
 def update(
     ref: str = typer.Argument(
-        ..., help="Jira key (BI-123), Azure DevOps id (258694) or the ticket's URL"
+        None, help="Jira key (BI-123), Azure DevOps id (258694) or the ticket's URL"
     ),
     text: list[str] = typer.Argument(
         None, help="The new information; `-` reads stdin; asked for if left out"
@@ -535,6 +597,15 @@ def update(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview only, never write"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Write without asking"),
+    save: Path = typer.Option(
+        None, "--save", help="Write the addition to this JSON file (edit it, then write it with --from)"
+    ),
+    load: Path = typer.Option(
+        None, "--from", help="Use the addition saved with --save instead of writing a new one"
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the result (or the addition, with -n) as JSON; messages go to stderr"
+    ),
 ):
     """Add new information to an existing ticket, written by the model in the ticket's style.
 
@@ -545,13 +616,26 @@ def update(
 
     Preview: **y** write · **r** rewrite (optionally with feedback) · **s** switch comment ↔
     description · **e** edit in $EDITOR · **n** cancel.
+
+    For scripts and agents: **-n --save u.json** previews and keeps the addition, **--from u.json -y**
+    writes exactly that, and **--json** prints machine-readable output.
     """
     if as_comment and as_description:
         _die("Use either --comment or --description, not both")
     target = "comment" if as_comment else "description" if as_description else None
     cfg = load_config()
+    saved = _load_saved(load, "update") if load else None
+    if saved:
+        ref, where = saved["ref"], where or saved["site"]
+    elif not ref:
+        _die("Which ticket? Give a key, id or URL (or --from a saved file)")
     ticket, backend = _locate_ticket(ref, where)
-    info = _read_description(text or [], paste, prompt="New information for " + ticket.ref)
+    if saved:
+        info = saved["input"]
+        loaded = Update(**saved["update"])
+    else:
+        info = _read_description(text or [], paste, prompt="New information for " + ticket.ref)
+        loaded = None
     if not info:
         _die("Nothing to add")
     project = next(
@@ -563,12 +647,26 @@ def update(
 
     draft, feedback = None, None
     while True:
-        with console.status(f"Writing with {cfg.ollama.model}…"):
-            draft = llm.write_update(
-                cfg.ollama, ticket, info, target, draft, feedback, language=language
-            )
-        _show_update(draft, ticket, chosen=target is None)
+        if loaded:
+            draft, loaded, chosen = loaded, None, False
+        else:
+            with console.status(f"Writing with {cfg.ollama.model}…"):
+                draft = llm.write_update(
+                    cfg.ollama, ticket, info, target, draft, feedback, language=language
+                )
+            chosen = target is None
+        _show_update(draft, ticket, chosen=chosen)
+        state = {
+            "command": "update",
+            "site": backend.site.name,
+            "ref": ticket.ref,
+            "input": info,
+            "update": dataclasses.asdict(draft),
+        }
+        _save(save, state)
         if dry_run:
+            if as_json:
+                _print_json(state)
             return
         if yes:
             break
@@ -587,6 +685,7 @@ def update(
         if choice == "e":
             draft = Update(draft.target, _edit_text(draft.text), draft.reason)
             _show_update(draft, ticket, chosen=False)
+            _save(save, {**state, "update": dataclasses.asdict(draft)})
             if Prompt.ask("[bold]Write edited text?[/]", choices=["y", "n"], default="y") == "y":
                 break
             raise typer.Exit(1)
@@ -601,8 +700,31 @@ def update(
             url = backend.add_comment(ticket, draft.text)
         else:
             url = backend.append_description(ticket, draft.text)
+    if as_json:
+        _print_json({"ref": ticket.ref, "url": url, "target": draft.target})
+        return
     done = "Commented on" if draft.target == "comment" else "Added to the description of"
     console.print(f"[bold green]{done}[/] {ticket.ref}: {url}")
+
+
+def _save(path: Path | None, state: dict) -> None:
+    if path:
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        console.print(f"[dim]Saved to {path}[/]")
+
+
+def _load_saved(path: Path, command: str) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(f"Can't read {path}: {e}")
+    if data.get("command") != command:
+        _die(f"{path} was saved by `tiket {data.get('command', '?')}`, not `tiket {command}`")
+    return data
+
+
+def _print_json(data: dict) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _show_update(draft: Update, ticket: Ticket, chosen: bool) -> None:

@@ -85,11 +85,28 @@ class Draft:
     acceptance_criteria: str = ""
     details: Details = field(default_factory=Details)
 
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Draft":
+        det = dict(d.get("details") or {})
+        for key in ("parent", "sprint"):
+            det[key] = Choice(**det[key]) if det.get(key) else None
+        return cls(
+            title=d["title"],
+            description=d["description"],
+            issue_type=d["issue_type"],
+            acceptance_criteria=d.get("acceptance_criteria", ""),
+            details=Details(**det),
+        )
+
 
 @dataclass
 class Created:
     url: str
     warnings: list[str] = field(default_factory=list)  # details that could not be set
+    ref: str = ""  # Jira key / ADO work item id
 
 
 @dataclass

@@ -55,6 +55,36 @@ Besides the text, `tiket` fills in the parent/epic, story points, priority, comp
 
 Press `s` in the preview to switch between the two, or force one with `-c` / `-d`.
 
+## Using tiket from Claude Code
+
+`skills/tiket/SKILL.md` teaches Claude Code to read tickets for context and to create or update
+them. It always previews first and writes only the exact draft you approved:
+
+```
+tiket new bf - -n --save /tmp/d.json <<< "facts…"   # preview, keep the draft (Claude may edit the JSON)
+tiket new --from /tmp/d.json -y --json             # create exactly that → {"ref", "url", "warnings"}
+tiket update BI-2314 - -n --save /tmp/u.json        # same for comments / description additions
+tiket update --from /tmp/u.json -y --json
+```
+
+Install the skill for every project, and make Claude ask before anything that writes:
+
+```
+ln -s "$PWD/skills/tiket" ~/.claude/skills/tiket
+```
+
+In `~/.claude/settings.json`:
+
+```json
+"permissions": {
+  "allow": ["Bash(tiket show:*)", "Bash(tiket tasks:*)", "Bash(COLUMNS=200 tiket tasks:*)", "Bash(tiket alias list)"],
+  "ask":   ["Bash(tiket new:*)", "Bash(tiket update:*)"]
+}
+```
+
+In a repo whose tickets live in one project, add a line to its CLAUDE.md such as
+"Tickets for this repo: tiket alias `bf`".
+
 ## Tests
 
 ```

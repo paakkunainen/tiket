@@ -37,6 +37,11 @@ def model(monkeypatch) -> FakeModel:
     return fake
 
 
+def flat(text: str) -> str:
+    """Undo Rich's line wrapping (long temp paths push messages over the terminal width)."""
+    return " ".join(text.split())
+
+
 def run(*args, input=None):
     return runner.invoke(cli.app, list(args), input=input)
 
@@ -296,6 +301,68 @@ def test_new_paste_errors(backend, model, monkeypatch, clip, message):
     result = run("new", "bf", "-p")
     assert result.exit_code == 2 and message in result.output
     assert model.calls == []
+
+
+# --- new: drafts for scripts and agents ---------------------------------------
+
+def test_new_save_then_create_exactly_that_draft(backend, model, tmp_path):
+    draft_file = tmp_path / "d.json"
+    model.drafts = [Draft("Saved title", "Saved body", "Bug", details=Details(parent=Choice("BI-890", "BI-890 AI", 1), labels=["x"]))]
+    result = run("new", "bf", "kuvaus", "-n", "--save", str(draft_file))
+    assert result.exit_code == 0, result.output
+    saved = json.loads(draft_file.read_text())
+    assert (saved["command"], saved["alias"], saved["input"]) == ("new", "bf", "kuvaus")
+    assert saved["draft"]["title"] == "Saved title" and saved["draft"]["details"]["parent"]["value"] == "BI-890"
+
+    saved["draft"]["title"] = "Tweaked by the agent"
+    draft_file.write_text(json.dumps(saved))
+    result = run("new", "--from", str(draft_file), "-y")
+    assert result.exit_code == 0, result.output
+    assert len(model.calls) == 1  # no new generation: the saved draft is created as is
+    created = backend.created[0][0]
+    assert created.title == "Tweaked by the agent" and created.issue_type == "Bug"
+    assert created.details.parent == Choice("BI-890", "BI-890 AI", 1) and created.details.labels == ["x"]
+
+
+def test_new_from_file_can_still_be_regenerated(backend, model, tmp_path):
+    draft_file = tmp_path / "d.json"
+    run("new", "bf", "kuvaus", "-n", "--save", str(draft_file))
+    run("new", "--from", str(draft_file), input="r\nshorter\ny\n")
+    assert model.calls[1]["user_text"] == "kuvaus" and model.calls[1]["feedback"] == "shorter"
+    assert model.calls[1]["types"] == ["Task"]  # stays with the saved draft's type
+
+
+def test_new_from_file_errors(backend, model, tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert "Can't read" in flat(run("new", "--from", str(bad)).output)
+    other = tmp_path / "u.json"
+    other.write_text(json.dumps({"command": "update"}))
+    assert "saved by `tiket update`, not `tiket new`" in flat(run("new", "--from", str(other)).output)
+    good = tmp_path / "d.json"
+    run("new", "bf", "x", "-n", "--save", str(good))
+    result = run("new", "edu", "--from", str(good))
+    assert result.exit_code == 2 and "a draft for 'bf', not 'edu'" in flat(result.output)
+
+
+def test_new_json_output(backend, model, tmp_path):
+    result = run("new", "bf", "kuvaus", "-y", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"ref": "BI-100", "url": "https://tracker.test/BI-100", "warnings": ["Could not set x"]}
+    assert "Generated title" in result.stderr  # the preview is still shown, on stderr
+
+    result = run("new", "bf", "kuvaus", "-n", "--json")
+    assert json.loads(result.stdout)["draft"]["title"] == "Generated title"
+
+
+def test_new_edit_is_saved(backend, model, tmp_path, monkeypatch):
+    script = tmp_path / "ed.py"
+    script.write_text("import sys, pathlib\np = pathlib.Path(sys.argv[1])\np.write_text(p.read_text().replace('Title: Generated title', 'Title: Mine'))\n")
+    monkeypatch.setenv("EDITOR", f"{sys.executable} {script}")
+    monkeypatch.delenv("VISUAL", raising=False)
+    draft_file = tmp_path / "d.json"
+    run("new", "bf", "x", "--save", str(draft_file), input="e\nn\n")
+    assert json.loads(draft_file.read_text())["draft"]["title"] == "Mine"
 
 
 # --- tasks --------------------------------------------------------------------
@@ -594,6 +661,31 @@ def test_update_uses_language_of_matching_alias(shown, writer, config_file):
     shown.tickets = {"ZZ-1": TICKET.__class__(**{**TICKET.to_dict(), "comments": [], "project": "ZZ"})}
     run("update", "ZZ-1", "x", "-n")
     assert writer.calls[1]["language"] is None  # no alias for ZZ: the model detects it
+
+
+def test_update_save_then_write_exactly_that(shown, writer, tmp_path):
+    f = tmp_path / "u.json"
+    assert run("update", "BI-5", "uutta", "-n", "--save", str(f)).exit_code == 0
+    saved = json.loads(f.read_text())
+    assert saved == {"command": "update", "site": "cloud", "ref": "BI-5", "input": "uutta",
+                     "update": {"target": "comment", "text": "comment text 1", "reason": "because"}}
+    saved["update"]["text"] = "agent wording"
+    f.write_text(json.dumps(saved))
+    result = run("update", "--from", str(f), "-y", "--json")
+    assert result.exit_code == 0, result.output
+    assert len(writer.calls) == 1
+    assert shown.updates == [("comment", "BI-5", "agent wording")]
+    assert shown.made[-1] == ("cloud", None)  # looked up on the saved site only
+    assert json.loads(result.stdout) == {
+        "ref": "BI-5", "url": "https://cloud.test/browse/BI-5?focusedCommentId=7", "target": "comment"
+    }
+
+
+def test_update_json_dry_run_and_missing_ref(shown, writer):
+    result = run("update", "BI-5", "x", "-n", "--json")
+    assert json.loads(result.stdout)["update"]["text"] == "comment text 1"
+    result = run("update")
+    assert result.exit_code == 2 and "Which ticket?" in result.output
 
 
 def test_update_unknown_ticket(shown, writer):

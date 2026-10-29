@@ -329,7 +329,7 @@ class AzureDevOpsBackend:
             # A guessed detail was rejected (e.g. parent closed meanwhile); still create the ticket
             item = post(with_details=False)
             warnings.append(f"Created without parent/area/iteration/points/priority: {e}")
-        return Created(item["_links"]["html"]["href"], warnings)
+        return Created(item["_links"]["html"]["href"], warnings, str(item["id"]))
 
     # --- one ticket in full ---------------------------------------------------
 

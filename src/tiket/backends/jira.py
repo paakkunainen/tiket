@@ -389,7 +389,7 @@ class JiraBackend:
                 )
             except RuntimeError as e:
                 warnings.append(f"Could not add to sprint {d.sprint.label}: {e}")
-        return Created(f"{self.site.url}/browse/{key}", warnings)
+        return Created(f"{self.site.url}/browse/{key}", warnings, key)
 
     def _create_issue(
         self, fields: dict, names: dict[str, str]
