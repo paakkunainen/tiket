@@ -28,6 +28,7 @@ class Item:
     updated: str  # ISO timestamp
     url: str
     done: bool = False
+    site: str = ""  # config site name, filled in by the caller
 
 
 @dataclass
@@ -91,6 +92,72 @@ class Created:
     warnings: list[str] = field(default_factory=list)  # details that could not be set
 
 
+@dataclass
+class Comment:
+    author: str
+    created: str  # ISO timestamp
+    body: str  # markdown-ish text
+
+
+@dataclass
+class Ticket:
+    """Everything worth knowing about one ticket, e.g. as context for an agent."""
+
+    ref: str
+    title: str
+    url: str
+    issue_type: str
+    status: str
+    project: str
+    created: str = ""
+    updated: str = ""
+    fields: dict[str, str] = field(default_factory=dict)  # assignee, priority, sprint, parent… (shown when set)
+    description: str = ""
+    acceptance_criteria: str = ""
+    links: list[str] = field(default_factory=list)  # "blocks BI-12 Title", "child 1234 Title"
+    attachments: list[str] = field(default_factory=list)  # "name (url)"
+    comments: list[Comment] = field(default_factory=list)  # oldest first
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_markdown(self) -> str:
+        out = [f"# {self.ref}: {self.title}", ""]
+        meta = {
+            "URL": self.url,
+            "Project": self.project,
+            "Type": self.issue_type,
+            "Status": self.status,
+            **self.fields,
+            "Created": self.created[:16].replace("T", " "),
+            "Updated": self.updated[:16].replace("T", " "),
+        }
+        out += [f"- **{k}:** {v}" for k, v in meta.items() if v]
+        out += ["", "## Description", "", _demote(self.description, 2) or "_(empty)_"]
+        if self.acceptance_criteria:
+            out += ["", "## Acceptance criteria", "", _demote(self.acceptance_criteria, 2)]
+        if self.links:
+            out += ["", "## Linked tickets", ""] + [f"- {link}" for link in self.links]
+        if self.attachments:
+            out += ["", "## Attachments", ""] + [f"- {a}" for a in self.attachments]
+        out += ["", f"## Comments ({len(self.comments)})"]
+        for c in self.comments:
+            out += ["", f"### {c.author}, {c.created[:16].replace('T', ' ')}", "", _demote(c.body, 3) or "_(empty)_"]
+        return "\n".join(out).rstrip() + "\n"
+
+
+def _demote(md: str, levels: int) -> str:
+    """Push headings inside ticket text below the document's own ## sections."""
+    out, in_code = [], False
+    for line in md.splitlines():
+        if line.startswith("```"):
+            in_code = not in_code
+        elif not in_code and re.match(r"#{1,6} ", line):
+            line = "#" * min(6, line.index(" ") + levels) + line[line.index(" "):]
+        out.append(line)
+    return "\n".join(out)
+
+
 class MissingFieldsError(RuntimeError):
     """The tracker rejected the ticket because required fields were empty."""
 
@@ -132,6 +199,9 @@ class Backend(Protocol):
     ) -> Created:
         """Create the ticket with its details."""
 
+    def ticket(self, ref: str) -> Ticket:
+        """Full ticket with description, fields, links and all comments; raises LookupError if not found."""
+
 
 def rank(values: list[tuple[str, str]]) -> list[Choice]:
     """(value, label) pairs, newest first -> Choices ordered by how often they were used (ties: newest)."""
@@ -141,16 +211,35 @@ def rank(values: list[tuple[str, str]]) -> list[Choice]:
     return sorted(choices.values(), key=lambda c: -c.count)
 
 
+def _code_block(m: re.Match) -> str:
+    return "\n```\n" + re.sub(r"<[^>]+>", "", m[1]).strip("\n") + "\n```\n"
+
+
+def _link(m: re.Match) -> str:
+    href, text = m[1], re.sub(r"<[^>]+>", "", m[2])
+    # Mentions, issue keys and anchors read fine as plain text
+    if href.startswith("#") or href == text or re.search(r"user-hover|issue-link|mention", m[0]):
+        return text
+    return f"[{text}]({href})"
+
+
 def html_to_text(s: str | None) -> str:
     """Rough HTML -> markdown-ish text, good enough to show the LLM a ticket's structure."""
     if not s:
         return ""
     s = re.sub(r"(?is)<(script|style).*?</\1>", "", s)
+    s = re.sub(r"(?is)<pre[^>]*>(.*?)</pre>", _code_block, s)
+    s = re.sub(r"(?is)<code[^>]*>(.*?)</code>", r"`\1`", s)
+    s = re.sub(r'(?is)<a [^>]*href="([^"]+)"[^>]*>(.*?)</a>', _link, s)
+    s = re.sub(r"(?i)</t[dh]>\s*<t[dh][^>]*>", " | ", s)
     s = re.sub(r"(?i)<h([1-6])[^>]*>", lambda m: "\n" + "#" * int(m.group(1)) + " ", s)
     s = re.sub(r"(?i)<li[^>]*>", "\n- ", s)
     s = re.sub(r"(?i)</?(b|strong)>", "**", s)
+    s = re.sub(r"(?i)</(ul|ol|table)>", "\n\n", s)
     s = re.sub(r"(?i)<br\s*/?>|</(p|div|h[1-6]|tr|pre)>", "\n", s)
     s = re.sub(r"<[^>]+>", "", s)
     s = html.unescape(s).replace("\xa0", " ")
     s = re.sub(r"[ \t]+\n", "\n", s)
-    return re.sub(r"\n{3,}", "\n\n", s).strip()
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    # <li><p>…</p></li> and table rows come out double spaced; keep lists and tables tight
+    return re.sub(r"(?m)^((?:- | *\S.* \| ).*)\n\n(?=- |\S.* \| )", r"\1\n", s)

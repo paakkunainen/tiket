@@ -9,12 +9,14 @@ import markdown
 from ..config import Project, Site
 from .base import (
     Choice,
+    Comment,
     Created,
     Draft,
     Example,
     Item,
     MissingFieldsError,
     Profile,
+    Ticket,
     html_to_text,
     rank,
 )
@@ -328,6 +330,101 @@ class AzureDevOpsBackend:
             item = post(with_details=False)
             warnings.append(f"Created without parent/area/iteration/points/priority: {e}")
         return Created(item["_links"]["html"]["href"], warnings)
+
+    # --- one ticket in full ---------------------------------------------------
+
+    def ticket(self, ref: str) -> Ticket:
+        if not ref.isdigit():
+            raise LookupError(f"Azure DevOps work item ids are numbers, got '{ref}'")
+        try:
+            item = self._req("GET", f"/_apis/wit/workitems/{ref}", params={"$expand": "relations"})
+        except RuntimeError as e:
+            if "TF401232" in str(e) or "404" in str(e):
+                raise LookupError(f"Work item {ref} not found on {self.site.name}") from None
+            raise
+        f = item["fields"]
+        project = f["System.TeamProject"]
+
+        def person(v) -> str:
+            return v.get("displayName", "") if isinstance(v, dict) else (v or "")
+
+        def num(v) -> str:
+            return f"{v:g}" if isinstance(v, (int, float)) else ""
+
+        parent = ""
+        links, attachments = [], []
+        rels = item.get("relations") or []
+        linked = [r for r in rels if "/workItems/" in r["url"]]
+        ids = [int(r["url"].rsplit("/", 1)[1]) for r in linked]
+        titles = {
+            w["id"]: w["fields"]
+            for w in self._work_items(sorted(set(ids)), ["System.Title", "System.State", "System.WorkItemType"])
+        }
+        for r, wid in zip(linked, ids):
+            w = titles.get(wid, {})
+            label = f"{wid} {w['System.Title']} ({w['System.WorkItemType']}, {w['System.State']})" if w else str(wid)
+            kind = (r.get("attributes") or {}).get("name") or r["rel"].rsplit(".", 1)[-1]
+            if r["rel"] == "System.LinkTypes.Hierarchy-Reverse":
+                parent = label
+            else:
+                links.append(f"{kind.lower()} {label}")
+        for r in rels:
+            attrs = r.get("attributes") or {}
+            if r["rel"] == "AttachedFile":
+                attachments.append(f"{attrs.get('name', 'file')} ({r['url']})")
+            elif r["rel"] == "Hyperlink":
+                links.append(f"link {r['url']}" + (f" ({attrs['comment']})" if attrs.get("comment") else ""))
+            elif r["rel"] == "ArtifactLink":
+                links.append(f"{attrs.get('name', 'artifact').lower()} {r['url']}")
+
+        return Ticket(
+            ref=str(item["id"]),
+            title=f["System.Title"],
+            url=f"{self.site.url}/{quote(project)}/_workitems/edit/{item['id']}",
+            issue_type=f["System.WorkItemType"],
+            status=f["System.State"],
+            project=project,
+            created=f.get("System.CreatedDate", ""),
+            updated=f.get("System.ChangedDate", ""),
+            fields={
+                "Assignee": person(f.get("System.AssignedTo")) or "unassigned",
+                "Created by": person(f.get("System.CreatedBy")),
+                "Priority": num(f.get(PRIORITY)),
+                "Parent": parent,
+                "Story points": num(f.get(STORY_POINTS)),
+                "Iteration": f.get("System.IterationPath", ""),
+                "Area": f.get("System.AreaPath", ""),
+                "Tags": f.get("System.Tags", ""),
+                "Reason": f.get("System.Reason", ""),
+            },
+            description=html_to_text(f.get("System.Description") or f.get(REPRO_STEPS)),
+            acceptance_criteria=html_to_text(f.get(ACCEPTANCE)),
+            links=links,
+            attachments=attachments,
+            comments=self._comments(project, item["id"]),
+        )
+
+    def _comments(self, project: str, wid: int) -> list[Comment]:
+        comments: list[Comment] = []
+        token = None
+        while True:
+            params = {"api-version": "7.1-preview.4", "$top": 200, "order": "asc"}
+            if token:
+                params["continuationToken"] = token
+            data = self._req("GET", f"/{quote(project)}/_apis/wit/workItems/{wid}/comments", params=params)
+            comments += [
+                Comment(
+                    author=(c.get("createdBy") or {}).get("displayName", "?"),
+                    created=c.get("createdDate", ""),
+                    body=html_to_text(c.get("text")),
+                )
+                for c in data.get("comments", [])
+                if not c.get("isDeleted")
+            ]
+            token = data.get("continuationToken")
+            if not token:
+                return comments
+
 
 def _wiql_str(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"

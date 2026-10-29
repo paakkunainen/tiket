@@ -3,6 +3,7 @@ from .azure_devops import AzureDevOpsBackend
 from .base import (
     Backend,
     Choice,
+    Comment,
     Created,
     Details,
     Draft,
@@ -10,6 +11,7 @@ from .base import (
     Item,
     MissingFieldsError,
     Profile,
+    Ticket,
 )
 from .jira import JiraBackend
 
@@ -27,6 +29,7 @@ def make_backend(site: Site, project: Project | None = None) -> Backend:
 __all__ = [
     "Backend",
     "Choice",
+    "Comment",
     "Created",
     "Details",
     "Draft",
@@ -34,5 +37,6 @@ __all__ = [
     "Item",
     "MissingFieldsError",
     "Profile",
+    "Ticket",
     "make_backend",
 ]

@@ -18,8 +18,9 @@ from rich.table import Table
 from . import aliases
 from . import details as ticket_details
 from . import llm, style_cache
-from .backends import Draft, Example, Item, MissingFieldsError, Profile, make_backend
-from .config import ConfigError, load_config, load_sites
+from .backends import Draft, Example, Item, MissingFieldsError, Profile, Ticket, make_backend
+from .clipboard import copy_to_clipboard
+from .config import ConfigError, Site, load_config, load_sites
 
 app = typer.Typer(
     add_completion=False,
@@ -34,11 +35,12 @@ model (Ollama) in each team's own style, and browse the tickets assigned to you.
 
 ```
 tiket bf "dashboard latautuu hitaasti koko vuoden aikavälillä"
-tiket esko -t bug "kirjautuminen kaatuu safarilla"     # set the type yourself
-tiket                                                  # pick project, then describe
-tiket tasks                                            # browse your tickets, y = copy
-tiket alias                                            # list / add / rename project aliases
-tiket doctor                                           # check Ollama and all credentials
+tiket esko -t bug "kirjautuminen kaatuu"   # set the type yourself
+tiket                                      # pick project, then describe
+tiket tasks                                # browse your tickets, y = copy
+tiket show TIJOFI-5173 -c                  # copy ticket + comments
+tiket alias                                # manage project aliases
+tiket doctor                               # check Ollama and credentials
 ```
 """,
 )
@@ -68,7 +70,7 @@ TYPE_SYNONYMS |= {
     "tarina": TYPE_SYNONYMS["story"],
     "parannus": TYPE_SYNONYMS["improvement"],
 }
-SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "alias", "config"}
+SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "show", "alias", "config"}
 # Work item types that are never a sensible target or style example for a quick ticket
 IGNORED_TYPES = {
     "Test Case",
@@ -271,9 +273,9 @@ TASK_SORTS = {
 ```
 j / k, arrows     move              y        copy "KEY Title"
 g / G             first / last      Y        copy the URL
-ctrl-d / ctrl-u   half page         o, enter open in browser
-/                 filter            esc      clear filter
-q                 quit
+ctrl-d / ctrl-u   half page         c        copy full ticket as markdown
+/                 filter            o, enter open in browser
+q                 quit              esc      clear filter
 ```
 
 **Examples**
@@ -356,6 +358,7 @@ def tasks(
             failed.append(site)
             continue
         for item in result:
+            item.site = site
             if item.url not in seen:
                 seen.add(item.url)
                 rows.append(
@@ -385,10 +388,14 @@ def tasks(
                     _ago(item.updated),
                     item.url,
                     item.done,
+                    item.site,
                 )
                 for label, item in rows
             ],
             note=note,
+            fetch=lambda row: _ticket_summary(
+                make_backend(sites[row.site]).ticket(row.key)
+            ),
         ).run()
         return
 
@@ -431,6 +438,117 @@ def tasks(
         f"[dim]{len(rows)} ticket(s){'' if include_done else ', open only (-a for all)'}. "
         "Keys are links (cmd-click).[/]"
     )
+
+
+@app.command(
+    epilog="""**Examples**
+
+```
+tiket show TIJOFI-5173            # read it in the terminal
+tiket show TIJOFI-5173 -c         # copy as markdown for an agent chat
+tiket show 258694 > ticket.md     # piped = plain markdown
+tiket show https://jira.eduuni.fi/browse/OPHJODTA-3292
+tiket show "BI-123 Some title"    # what y in tiket tasks copies
+tiket show BI-123 --json | jq .comments
+```
+
+An agent can run `tiket show <KEY>` itself to read a ticket.
+"""
+)
+def show(
+    ref: str = typer.Argument(
+        ...,
+        help="Jira key (BI-123), Azure DevOps id (258694) or the ticket's URL",
+    ),
+    where: str = typer.Option(
+        None,
+        "--in",
+        "-i",
+        help="Alias or site to look in; normally found from the key's project or by trying each site",
+    ),
+    copy: bool = typer.Option(
+        False, "--copy", "-c", help="Copy the markdown to the clipboard instead of printing it"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON instead of markdown"),
+    raw: bool = typer.Option(
+        False, "--raw", "-r", help="Print plain markdown in the terminal too (no formatting)"
+    ),
+):
+    """Show one ticket in full: fields, description, links, attachments and every comment.
+
+    The output is markdown, handy as context for an AI agent: copy it with **-c**, or pipe it.
+    """
+    ticket = _find_ticket(ref, where)
+    if as_json:
+        print(json.dumps(ticket.to_dict(), ensure_ascii=False, indent=2))
+        return
+    text, summary = _ticket_summary(ticket)
+    if copy:
+        if not copy_to_clipboard(text):
+            _die("No clipboard tool found (pbcopy / wl-copy / xclip); pipe the output instead.")
+        console.print(f"[green]Copied[/] {summary}")
+    elif raw or not sys.stdout.isatty():
+        print(text, end="")
+    else:
+        console.print(Markdown(text))
+
+
+def _ticket_summary(ticket: Ticket) -> tuple[str, str]:
+    text = ticket.to_markdown()
+    return text, f"{ticket.ref} {ticket.title} ({len(ticket.comments)} comments, {len(text):,} chars)"
+
+
+def _find_ticket(ref: str, where: str | None) -> Ticket:
+    """Resolve a key / id / URL to a ticket, trying the most likely sites first."""
+    cfg = load_config()
+    sites = load_sites()
+    ref = ref.strip()
+    candidates: list[Site] = []
+
+    if re.match(r"https?://", ref):
+        site = next(
+            (s for s in sites.values() if ref.lower().startswith(s.url.lower().rstrip("/"))),
+            None,
+        )
+        m = re.search(
+            r"(?:/browse/|selectedIssue=)([A-Za-z][A-Za-z0-9_]*-\d+)|/(?:_workitems/edit|workitems)/(\d+)",
+            ref,
+            re.IGNORECASE,
+        )
+        if not site or not m:
+            _die(f"Can't tell which configured site or ticket that URL points to: {ref}")
+        ref, candidates = m[1] or m[2], [site]
+    else:
+        ref = ref.split()[0]  # "BI-123 Some title" → BI-123
+
+    if where:
+        if where in cfg.projects:
+            candidates = [cfg.projects[where].site]
+        elif where in sites:
+            candidates = [sites[where]]
+        else:
+            _die(f"'{where}' is neither an alias nor a site. Aliases: {', '.join(cfg.projects)}")
+    if not candidates:
+        jira = ref.split("-")[0].lower() if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*-\d+", ref) else None
+        if not jira and not ref.isdigit():
+            _die(f"'{ref}' doesn't look like a Jira key (BI-123) or an Azure DevOps id (258694).")
+        kinds = ("jira_cloud", "jira_dc") if jira else ("azure_devops",)
+        # Sites with an alias for this project key first, then the other sites of the right kind
+        preferred = [p.site for p in cfg.projects.values() if jira and p.project.lower() == jira]
+        candidates = list(
+            {s.name: s for s in preferred + [s for s in sites.values() if s.kind in kinds]}.values()
+        )
+
+    errors = []
+    with console.status(f"Fetching {ref}…"):
+        for site in candidates:
+            try:
+                return make_backend(site).ticket(ref)
+            except LookupError:
+                continue
+            except RuntimeError as e:
+                errors.append(f"{site.name}: {e}")
+    _die("\n".join(errors) or f"{ref} not found on {', '.join(s.name for s in candidates)}.")
 
 
 @app.command("list", hidden=True)

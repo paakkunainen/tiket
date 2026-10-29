@@ -6,17 +6,25 @@ import httpx
 from ..config import Project, Site
 from .base import (
     Choice,
+    Comment,
     Created,
     Draft,
     Example,
     Item,
     MissingFieldsError,
     Profile,
+    Ticket,
     html_to_text,
     rank,
 )
 
 PROFILE_SAMPLE = 50
+MAX_CHILDREN = 100  # an epic's children listed by `tiket show`; Cloud returns at most 100 per page
+TICKET_FIELDS = [
+    "summary", "issuetype", "status", "project", "priority", "assignee", "reporter", "created",
+    "updated", "resolution", "labels", "components", "fixVersions", "parent", "description",
+    "issuelinks", "subtasks", "attachment",
+]
 # Fields every ticket needs; anything else we set is a "detail" that may be dropped if Jira rejects it
 BASE_FIELDS = {"project", "summary", "description", "issuetype"}
 
@@ -397,12 +405,135 @@ class JiraBackend:
         raise RuntimeError(f"Jira POST /rest/api/2/issue -> {r.status_code}: {r.text[:1000]}")
 
 
+    # --- one ticket in full ---------------------------------------------------
+
+    def ticket(self, ref: str) -> Ticket:
+        key = ref.upper()
+        ids, story_point_fields = self._field_ids()
+        r = self.http.get(
+            f"/rest/api/2/issue/{key}",
+            params={
+                "fields": ",".join(TICKET_FIELDS + list(ids.values()) + story_point_fields),
+                "expand": "renderedFields",
+            },
+        )
+        if r.status_code == 404:
+            raise LookupError(f"{key} not found on {self.site.name}")
+        if r.is_error:
+            raise RuntimeError(f"Jira GET /rest/api/2/issue/{key} -> {r.status_code}: {r.text[:1000]}")
+        issue = r.json()
+        f, rendered = issue["fields"], issue.get("renderedFields") or {}
+
+        def name(v: dict | None) -> str:
+            return (v or {}).get("displayName") or (v or {}).get("name") or ""
+
+        parent = ""
+        if p := f.get("parent"):
+            parent = f"{p['key']} {p['fields']['summary']}"
+        elif epic := f.get(ids.get("epic_link", "")):
+            parent = self._issue_label(epic)
+        sprints = [_parse_sprint(s) for s in f.get(ids.get("sprint", "")) or []]
+        points = next((f[fid] for fid in story_point_fields if f.get(fid) is not None), None)
+        fields = {
+            "Assignee": name(f.get("assignee")) or "unassigned",
+            "Reporter": name(f.get("reporter")),
+            "Priority": name(f.get("priority")),
+            "Resolution": name(f.get("resolution")),
+            "Parent": parent,
+            "Story points": f"{points:g}" if isinstance(points, (int, float)) else "",
+            "Sprint": _sprint_summary(sprints),
+            "Components": ", ".join(c["name"] for c in f.get("components") or []),
+            "Labels": ", ".join(f.get("labels") or []),
+            "Fix versions": ", ".join(v["name"] for v in f.get("fixVersions") or []),
+        }
+
+        links = []
+        for link in f.get("issuelinks") or []:
+            if other := link.get("outwardIssue"):
+                links.append(f"{link['type']['outward']} {other['key']} {other['fields']['summary']}")
+            elif other := link.get("inwardIssue"):
+                links.append(f"{link['type']['inward']} {other['key']} {other['fields']['summary']}")
+        links += [f"subtask {t['key']} {t['fields']['summary']} ({t['fields']['status']['name']})" for t in f.get("subtasks") or []]
+        links += self._children(key, f["issuetype"]["name"], ids)
+
+        return Ticket(
+            ref=issue["key"],
+            title=f["summary"],
+            url=f"{self.site.url}/browse/{issue['key']}",
+            issue_type=f["issuetype"]["name"],
+            status=f["status"]["name"],
+            project=f["project"]["key"],
+            created=f.get("created", ""),
+            updated=f.get("updated", ""),
+            fields=fields,
+            description=html_to_text(rendered.get("description")),
+            links=links,
+            attachments=[f"{a['filename']} ({a['content']})" for a in f.get("attachment") or []],
+            comments=self._comments(issue["key"]),
+        )
+
+    def _issue_label(self, key: str) -> str:
+        try:
+            issues = self._search(f"key = {key}", 1, ["summary"])
+        except RuntimeError:
+            return key
+        return f"{key} {issues[0]['fields']['summary']}" if issues else key
+
+    def _children(self, key: str, issue_type: str, ids: dict) -> list[str]:
+        """Issues under an epic / parent (subtasks come with the issue itself)."""
+        if self.cloud:
+            jql = f"parent = {key}"
+        elif "epic_link" in ids and issue_type.lower() == "epic":
+            jql = f"cf[{ids['epic_link'].split('_')[-1]}] = {key}"
+        else:
+            return []
+        try:
+            issues = self._search(jql + " ORDER BY created DESC", MAX_CHILDREN, ["summary", "status", "issuetype"])
+        except RuntimeError:
+            return []
+        children = [
+            f"child {i['key']} {i['fields']['summary']} ({i['fields']['status']['name']})"
+            for i in issues
+            if not i["fields"]["issuetype"].get("subtask")  # already listed as subtasks
+        ]
+        if len(issues) >= MAX_CHILDREN:
+            children.append(f"… only the newest {MAX_CHILDREN} children are listed")
+        return children
+
+    def _comments(self, key: str) -> list[Comment]:
+        comments: list[Comment] = []
+        while True:
+            data = self._req(
+                "GET",
+                f"/rest/api/2/issue/{key}/comment",
+                params={"expand": "renderedBody", "startAt": len(comments), "maxResults": 100},
+            )
+            page = data.get("comments", [])
+            comments += [
+                Comment(
+                    author=(c.get("author") or {}).get("displayName", "?"),
+                    created=c.get("created", ""),
+                    body=html_to_text(c.get("renderedBody")) or c.get("body", ""),
+                )
+                for c in page
+            ]
+            if not page or len(comments) >= data.get("total", 0):
+                return comments
+
+
 def _parse_sprint(s: dict | str) -> dict:
     """Cloud returns sprint objects, Data Center a "...Sprint@1a2b[id=1,name=x,...]" string."""
     if isinstance(s, dict):
         return {"id": s.get("id"), "name": s.get("name", ""), "board": s.get("boardId")}
     attrs = dict(re.findall(r"(\w+)=([^,\]]*)", s))
     return {"id": attrs.get("id", 0), "name": attrs.get("name", ""), "board": attrs.get("rapidViewId")}
+
+
+def _sprint_summary(sprints: list[dict]) -> str:
+    if not sprints:
+        return ""
+    *earlier, latest = sorted(sprints, key=lambda s: int(s["id"] or 0))
+    return latest["name"] + (f" (carried over from {len(earlier)} earlier)" if earlier else "")
 
 
 def _sprint_family(name: str) -> str:

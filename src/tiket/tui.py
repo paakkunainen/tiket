@@ -1,14 +1,16 @@
 """Interactive, vim-style browser for `tiket tasks`."""
 
-import shutil
-import subprocess
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Header, Input
+
+from .clipboard import copy_to_clipboard
 
 
 @dataclass
@@ -21,18 +23,11 @@ class TaskRow:
     updated: str
     url: str
     done: bool
+    site: str = ""
 
     def matches(self, needle: str) -> bool:
         haystack = f"{self.key} {self.title} {self.project} {self.issue_type} {self.status}"
         return needle.lower() in haystack.lower()
-
-
-def copy_to_clipboard(text: str) -> bool:
-    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
-        if shutil.which(cmd[0]):
-            subprocess.run(cmd, input=text.encode(), check=True)
-            return True
-    return False
 
 
 COLUMNS = ("key", "title", "project", "type", "status", "updated")
@@ -50,6 +45,7 @@ class TaskTable(DataTable):
         Binding("ctrl+u", "half_page(-1)", "½ page up", show=False),
         Binding("y", "yank", "yank key+title"),
         Binding("Y", "yank_url", "yank url"),
+        Binding("c", "yank_context", "copy full ticket"),
         Binding("o", "open", "open"),
         Binding("slash", "filter", "filter"),
         Binding("q", "app.quit", "quit"),
@@ -73,6 +69,10 @@ class TaskTable(DataTable):
     def action_yank_url(self) -> None:
         if row := self.app.current():
             self.app.yank(row.url)
+
+    def action_yank_context(self) -> None:
+        if row := self.app.current():
+            self.app.yank_context(row)
 
     def action_open(self) -> None:
         if row := self.app.current():
@@ -100,8 +100,14 @@ class TaskBrowser(App):
     FilterInput.visible { display: block; }
     """
 
-    def __init__(self, rows: list[TaskRow], note: str = ""):
+    def __init__(
+        self,
+        rows: list[TaskRow],
+        note: str = "",
+        fetch: Callable[[TaskRow], tuple[str, str]] | None = None,
+    ):
         super().__init__()
+        self.fetch = fetch  # row -> (markdown, short summary) for the "copy full ticket" key
         self.all_rows = rows
         self.shown: list[TaskRow] = rows
         self.filter_text = ""
@@ -179,10 +185,22 @@ class TaskBrowser(App):
 
     # --- actions used by the widgets --------------------------------------
 
-    def yank(self, text: str) -> None:
+    def yank(self, text: str, message: str | None = None) -> None:
         if not copy_to_clipboard(text):
             self.copy_to_clipboard(text)  # OSC 52 fallback, works in most modern terminals
-        self.notify(text, title="Copied", timeout=2)
+        self.notify(message or text, title="Copied", timeout=2)
+
+    @work(thread=True, exclusive=True)
+    def yank_context(self, row: TaskRow) -> None:
+        if not self.fetch:
+            return
+        self.call_from_thread(self.notify, f"Fetching {row.key}…", timeout=2)
+        try:
+            text, summary = self.fetch(row)
+        except Exception as e:
+            self.call_from_thread(self.notify, str(e), title=row.key, severity="error")
+            return
+        self.call_from_thread(self.yank, text, summary)
 
     def set_filter(self, text: str) -> None:
         self.filter_text = text
