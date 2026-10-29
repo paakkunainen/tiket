@@ -171,3 +171,18 @@ def test_clipboard_tools(monkeypatch):
 
     monkeypatch.setattr(clipboard.shutil, "which", lambda name: None)
     assert clipboard.copy_to_clipboard("x") is False
+
+
+def test_paste_from_clipboard_tools(monkeypatch):
+    calls = []
+
+    class Done:
+        stdout = "notes\nline 2".encode()
+
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: name == "wl-paste")
+    monkeypatch.setattr(clipboard.subprocess, "run", lambda cmd, capture_output, check: calls.append(cmd) or Done)
+    assert clipboard.paste_from_clipboard() == "notes\nline 2"
+    assert calls == [["wl-paste", "--no-newline"]]
+
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: None)
+    assert clipboard.paste_from_clipboard() is None

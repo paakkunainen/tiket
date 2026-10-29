@@ -260,6 +260,44 @@ def test_new_empty_description(backend, model):
     assert "Empty description" in result.output
 
 
+NOTES = "Things to know before switching\n\nCase, not project.\ny\n\nLegacy table;Replaced by;Can switch now?\nFUNDING;F_FUNDING_GRANT;Yes\n"
+
+
+def test_new_multiline_description_from_stdin_is_kept_whole(backend, model):
+    # the lone "y" line is part of the notes; it must never answer the create prompt
+    result = run("new", "bf", input=NOTES)
+    assert model.calls[0]["user_text"] == NOTES.strip()
+    assert backend.created == [] and result.exit_code == 1
+
+
+def test_new_dash_reads_stdin(backend, model):
+    run("new", "bf", "-", input=NOTES)
+    assert model.calls[0]["user_text"] == NOTES.strip()
+
+
+def test_new_interactive_prompt_reads_until_ctrl_d(backend, model, monkeypatch):
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    result = run("new", "bf", input=NOTES)
+    assert "end with Ctrl-D on an empty line" in result.output
+    assert model.calls[0]["user_text"] == NOTES.strip()
+
+
+def test_new_paste_uses_clipboard_after_given_text(backend, model, monkeypatch):
+    monkeypatch.setattr(cli, "paste_from_clipboard", lambda: NOTES)
+    run("new", "bf", "-p", "-n")
+    assert model.calls[0]["user_text"] == NOTES.strip()
+    run("new", "bf", "pub_funding switch guide", "-p", "-n")
+    assert model.calls[1]["user_text"] == "pub_funding switch guide\n\n" + NOTES.strip()
+
+
+@pytest.mark.parametrize("clip, message", [(None, "No clipboard tool found"), (" \n", "The clipboard is empty")])
+def test_new_paste_errors(backend, model, monkeypatch, clip, message):
+    monkeypatch.setattr(cli, "paste_from_clipboard", lambda: clip)
+    result = run("new", "bf", "-p")
+    assert result.exit_code == 2 and message in result.output
+    assert model.calls == []
+
+
 # --- tasks --------------------------------------------------------------------
 
 def item(ref, project, title="t", issue_type="Task", status="Open", updated="2026-10-01T00:00:00Z", done=False):

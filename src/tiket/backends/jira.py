@@ -29,11 +29,16 @@ TICKET_FIELDS = [
 BASE_FIELDS = {"project", "summary", "description", "issuetype"}
 
 
+_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_SEP = re.compile(r"^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*(:?-{3,}:?\s*)?$")
+
+
 def md_to_jira(md: str) -> str:
     """Convert the subset of markdown the LLM produces into Jira wiki markup."""
     out: list[str] = []
     in_code = False
-    for line in md.splitlines():
+    lines = md.splitlines()
+    for i, line in enumerate(lines):
         if line.strip().startswith("```"):
             if in_code:
                 out.append("{code}")
@@ -45,7 +50,14 @@ def md_to_jira(md: str) -> str:
         if in_code:
             out.append(line)
             continue
-        if m := re.match(r"^(#{1,6})\s+(.*)", line):
+        if _TABLE_SEP.match(line):
+            continue
+        if _TABLE_ROW.match(line):
+            header = i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1])
+            bar = "||" if header else "|"
+            cells = [_inline(c.strip()) or " " for c in line.strip().strip("|").split("|")]
+            out.append(bar + bar.join(cells) + bar)
+        elif m := re.match(r"^(#{1,6})\s+(.*)", line):
             out.append(f"h{len(m[1])}. {_inline(m[2])}")
         elif m := re.match(r"^(\s*)[-*+]\s+(.*)", line):
             out.append("*" * (len(m[1].expandtabs(2)) // 2 + 1) + " " + _inline(m[2]))

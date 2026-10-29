@@ -41,6 +41,19 @@ def test_md_to_jira_lines(md, wiki):
     assert md_to_jira(md) == wiki
 
 
+def test_md_to_jira_tables():
+    md = "Intro\n\n| Legacy | Replaced by | Switch? |\n|---|:---:|---|\n| FUNDING | `F_FUNDING_GRANT` + **D_X** | Yes |\n| FUNDING_EVENT_TEXT | | No |\n\n---"
+    assert md_to_jira(md) == (
+        "Intro\n\n||Legacy||Replaced by||Switch?||\n"
+        "|FUNDING|{{F_FUNDING_GRANT}} + *D_X*|Yes|\n"
+        "|FUNDING_EVENT_TEXT| |No|\n\n----"
+    )
+
+
+def test_md_to_jira_table_without_header():
+    assert md_to_jira("| a | b |\n| c | d |") == "|a|b|\n|c|d|"
+
+
 def test_md_to_jira_code_blocks_are_left_alone():
     md = "```sql\nSELECT **x** FROM t; -- # not a heading\n```\n- after"
     assert md_to_jira(md) == "{code:sql}\nSELECT **x** FROM t; -- # not a heading\n{code}\n* after"

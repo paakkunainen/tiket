@@ -19,7 +19,7 @@ from . import aliases
 from . import details as ticket_details
 from . import llm, style_cache
 from .backends import Draft, Example, Item, MissingFieldsError, Profile, Ticket, make_backend
-from .clipboard import copy_to_clipboard
+from .clipboard import copy_to_clipboard, paste_from_clipboard
 from .config import ConfigError, Site, load_config, load_sites
 
 app = typer.Typer(
@@ -27,7 +27,7 @@ app = typer.Typer(
     no_args_is_help=False,
     rich_markup_mode="markdown",
     context_settings={"help_option_names": ["-h", "--help"]},
-    help="""Create tickets in Jira / Azure DevOps from a one-line description, written by a local
+    help="""Create tickets in Jira / Azure DevOps from a short description or pasted notes, written by a local
 model (Ollama) in each team's own style, and browse the tickets assigned to you.
 
 `tiket <alias> "…"` is short for `tiket new <alias> "…"`. Run `tiket <command> -h` for details.""",
@@ -36,6 +36,7 @@ model (Ollama) in each team's own style, and browse the tickets assigned to you.
 ```
 tiket bf "dashboard latautuu hitaasti koko vuoden aikavälillä"
 tiket esko -t bug "kirjautuminen kaatuu"   # set the type yourself
+tiket bf -p                                # long notes from the clipboard
 tiket                                      # pick project, then describe
 tiket tasks                                # browse your tickets, y = copy
 tiket show TIJOFI-5173 -c                  # copy ticket + comments
@@ -95,7 +96,10 @@ tiket bf "power bi raportin päivitys epäonnistuu yöllä"
 tiket tijo -t bug "aineistopäivitys kaatuu"    # bug → Virhe on TIJOFI
 tiket esko "…" -n                              # preview only
 tiket edu "…" -D                               # no guessed details
-tiket edu "…" -r                               # re-read recent tickets first
+tiket edu "…" -r                               # re-read recent tickets
+tiket bf -p                                    # clipboard as description
+tiket bf "summary line" -p                     # short note + clipboard
+pbpaste | tiket bf -                           # description from stdin
 ```
 """
 )
@@ -104,7 +108,9 @@ def new(
         None, help="Project alias from config (omit for a picker)"
     ),
     text: list[str] = typer.Argument(
-        None, help="Short description of the problem; asked for if left out"
+        None,
+        help="Description of the problem: a few words or longer notes. `-` reads it from stdin; "
+        "asked for if left out",
     ),
     issue_type: str = typer.Option(
         None,
@@ -123,6 +129,12 @@ def new(
         help="Re-read recent tickets (style and detail history are cached for 24 h)",
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Create without asking"),
+    paste: bool = typer.Option(
+        False,
+        "--paste",
+        "-p",
+        help="Use the clipboard as the description (after any text you give, e.g. a one-line summary)",
+    ),
     no_details: bool = typer.Option(
         False,
         "--no-details",
@@ -150,9 +162,7 @@ def new(
         _die(f"Unknown alias '{alias}'. Configured: {', '.join(cfg.projects)}")
     project = cfg.projects[alias]
 
-    user_text = " ".join(text or []).strip()
-    if not user_text:
-        user_text = Prompt.ask("[bold]Describe the problem[/]").strip()
+    user_text = _read_description(text or [], paste)
     if not user_text:
         _die("Empty description")
 
@@ -598,6 +608,45 @@ def doctor():
             console.print(f"[green]✓[/] {name:16} {make_backend(site).check()}")
         except Exception as e:
             console.print(f"[red]✗[/] {name:16} {e}")
+
+
+def _read_description(text: list[str], paste: bool) -> str:
+    """Join the words given, stdin (`-` or a pipe) and the clipboard (-p); prompt if all are empty."""
+    parts = []
+    if text == ["-"]:
+        parts.append(_read_stdin())
+    elif text:
+        parts.append(" ".join(text))
+    if paste:
+        clip = paste_from_clipboard()
+        if clip is None:
+            _die("No clipboard tool found (pbpaste, wl-paste or xclip)")
+        if not clip.strip():
+            _die("The clipboard is empty")
+        parts.append(clip)
+    if not parts and not _stdin_is_tty():
+        parts.append(_read_stdin())  # `pbpaste | tiket bf`
+    if not parts:
+        console.print(
+            "[bold]Describe the problem[/] [dim](paste or type; end with Ctrl-D on an empty line)[/]"
+        )
+        parts.append(sys.stdin.read())
+    return "\n\n".join(p.strip() for p in parts if p.strip())
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _read_stdin() -> str:
+    data = sys.stdin.read()
+    # the y/r/e/n prompts come after a piped description: read them from the terminal
+    if sys.stdin is sys.__stdin__ and not sys.stdin.isatty():
+        try:
+            sys.stdin = open("/dev/tty")
+        except OSError:
+            pass
+    return data
 
 
 def _pick_alias(projects) -> str:

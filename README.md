@@ -1,10 +1,13 @@
 # tiket
 
-Write a one-line problem description and get a ticket in your team's own style, created in Jira (Cloud or Data Center) or Azure DevOps. The ticket text is generated locally by Ollama (`gpt-oss:20b`), using the project's ~12 most recent tickets as style examples. Nothing leaves your machine except the final ticket.
+Write a short problem description (or paste longer notes) and get a ticket in your team's own style, created in Jira (Cloud or Data Center) or Azure DevOps. The ticket text is generated locally by Ollama (`gpt-oss:20b`), using the project's ~12 most recent tickets as style examples. Nothing leaves your machine except the final ticket.
 
 ```
 tiket <alias> "short problem description"   # preview → [y]es / [r]egenerate / [e]dit / [n]o
-tiket                                        # pick project + type description interactively
+tiket                                        # pick project, then type or paste (Ctrl-D ends)
+tiket <alias> -p                             # description = clipboard (multi-line notes, tables)
+tiket <alias> "summary" -p                   # short note + clipboard
+pbpaste | tiket <alias> -                    # description from stdin
 tiket <alias> "..." --dry-run                # just show what would be created
 tiket <alias> -t bug "..."                   # set the type yourself (bug / task / story / feature /
                                              # improvement, or the exact name); omit to let the model pick

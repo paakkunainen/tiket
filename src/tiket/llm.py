@@ -10,7 +10,8 @@ from .config import OllamaSettings, Project
 EXAMPLE_CHARS = 800
 
 SYSTEM = """You write tickets for the issue tracker project "{project}".
-Turn the user's short problem description into a ticket that looks like it was written by this team.
+Turn the user's description (a few words or longer pasted notes) into a ticket that looks like it was
+written by this team.
 
 Existing tickets from this project, grouped by issue type:
 
@@ -24,6 +25,8 @@ Existing tickets from this project, grouped by issue type:
 - Use ONLY facts from the user's description. Never invent symptoms, causes, browsers, environments,
   URLs, versions, names or numbers. Where a section the team always has would need unknown facts,
   put one short "TODO:" line in it. Use at most 2 TODOs and skip sections you have nothing for.
+- Long notes: keep every fact, name, number, list item and table row. Reorganise them into the team's
+  structure, but do not summarise detail away. Keep tables as Markdown tables and identifiers as `code`.
 - Description in Markdown (it is converted to the tracker's format afterwards).
 - issue_type must be one of: {types}.
 {ac_rule}{notes}
