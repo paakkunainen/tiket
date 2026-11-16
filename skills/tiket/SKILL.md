@@ -1,6 +1,6 @@
 ---
 name: tiket
-description: Read, create and update Jira / Azure DevOps tickets with the `tiket` CLI. Use when the user mentions a ticket (BI-2314, OPHJODTA-12, an Azure DevOps id like 258694, or a ticket URL), asks what their tickets are, wants context from a ticket, or asks to create a ticket or add a comment / new information to one, e.g. after finishing work on it.
+description: Read, create and update Jira / Azure DevOps tickets with the `tiket` CLI. Use when the user mentions a ticket (BI-2314, OPHJODTA-12, an Azure DevOps id like 258694, or a ticket URL), asks what their tickets are, wants context from a ticket, or asks to create a ticket, add a comment / new information to one, or change its status, e.g. after finishing work on it.
 ---
 
 # tiket
@@ -16,6 +16,7 @@ tiket show 258694                   # Azure DevOps id; ticket URLs work too
 COLUMNS=200 tiket tasks --plain     # the user's open tickets on every board
 COLUMNS=200 tiket tasks --plain bf  # …for one alias; add -a for done tickets, -s TEXT to search titles
 tiket alias list                    # aliases: which alias is which site / project
+tiket status BI-2314 --json         # current status and the statuses it can move to (changes nothing)
 ```
 
 Read the ticket before working on it, or before adding to it.
@@ -89,6 +90,20 @@ The model decides where the information goes and says why (`update.reason`):
 Force one with `-c` (comment) or `-d` (description) when the user asked for it. To switch after
 a preview, change `update.target` in the saved file. The text was written for the other target,
 so regenerating with `-c` / `-d` is usually better.
+
+## `status`: moving a ticket
+
+```bash
+tiket status BI-2314 --json                 # → {"status": "To Do", "available": [{"name", "via", "done"}, …]}
+tiket status BI-2314 "In Progress" --json   # → {"ref", "url", "from", "status", "changed"}
+```
+
+Nothing is written by the model here, so there is no draft: but the change is visible to the
+team, so move a ticket only when the user asked for it or agreed to it in this conversation.
+List the options first and use an exact `name` from `available` (or its `via`, the transition
+name, when two entries share a status). Always give `--json` or a status: a bare
+`tiket status KEY` may wait for a typed choice. If tiket says the workflow asks for more fields,
+tell the user to make that move in the browser.
 
 ## Exit codes
 

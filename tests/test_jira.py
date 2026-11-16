@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from tiket.backends import Choice, Details, Draft, MissingFieldsError, Profile
+from tiket.backends import Choice, Details, Draft, MissingFieldsError, Profile, Status
 from tiket.backends.jira import MAX_CHILDREN, JiraBackend, _parse_sprint, _sprint_summary
 
 CLOUD = "https://cloud.test"
@@ -623,3 +623,43 @@ def test_append_description_errors_are_raised(cloud):
     respx.put(f"{CLOUD}/rest/api/2/issue/BI-5").respond(403, text="no edit permission")
     with pytest.raises(RuntimeError, match="403: no edit permission"):
         cloud.append_description(jira_ticket(), "y")
+
+
+# --- status ---------------------------------------------------------------------
+
+@respx.mock
+def test_statuses_are_the_available_transitions(cloud):
+    route = respx.get(f"{CLOUD}/rest/api/2/issue/BI-5").respond(json={"fields": {"status": {"name": "To Do"}}, "transitions": [
+        {"id": "1", "name": "To Do", "to": {"name": "To Do", "statusCategory": {"key": "new"}}},
+        {"id": "11", "name": "Start progress", "to": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}}},
+        {"id": "31", "name": "done", "to": {"name": "Done", "statusCategory": {"key": "done"}}},
+        {"id": "41", "name": "Won't do", "to": {"name": "Done", "statusCategory": {"key": "done"}}},
+    ]})
+    assert cloud.statuses("bi-5") == [
+        Status("In Progress", "11", via="Start progress"),
+        Status("Done", "31", done=True),
+        Status("Done", "41", done=True, via="Won't do"),
+    ]
+    assert Status("Done", "41", via="Won't do").label == "Done (Won't do)"
+    assert dict(route.calls.last.request.url.params) == {"fields": "status", "expand": "transitions"}
+
+
+@respx.mock
+def test_set_status_posts_the_transition(dc):
+    route = respx.post(f"{DC}/rest/api/2/issue/BI-5/transitions").respond(204)
+    dc.set_status("BI-5", Status("Done", "31"))
+    assert body(route.calls.last.request) == {"transition": {"id": "31"}}
+
+
+@respx.mock
+def test_set_status_reports_fields_the_transition_needs(cloud):
+    route = respx.post(f"{CLOUD}/rest/api/2/issue/BI-5/transitions")
+    route.respond(400, json={"errorMessages": [], "errors": {"resolution": "Resolution is required."}})
+    with pytest.raises(MissingFieldsError) as e:
+        cloud.set_status("BI-5", Status("Done", "31"))
+    assert e.value.fields == [("resolution", "Resolution is required.")]
+
+    route.respond(400, json={"errorMessages": ["Transition is not valid"], "errors": {}})
+    with pytest.raises(RuntimeError, match="400: .*Transition is not valid") as e:
+        cloud.set_status("BI-5", Status("Done", "31"))
+    assert not isinstance(e.value, MissingFieldsError)

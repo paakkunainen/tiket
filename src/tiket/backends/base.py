@@ -119,6 +119,20 @@ class Update:
 
 
 @dataclass
+class Status:
+    """A status a ticket can be moved to right now."""
+
+    name: str
+    value: str  # what the API needs: Jira transition id / Azure DevOps state name
+    done: bool = False
+    via: str = ""  # Jira transition name when it says more than the status ("Won't do" → Done)
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({self.via})" if self.via else self.name
+
+
+@dataclass
 class Comment:
     author: str
     created: str  # ISO timestamp
@@ -233,6 +247,12 @@ class Backend(Protocol):
 
     def append_description(self, ticket: Ticket, text: str) -> str:
         """Append markdown to the end of the description, leaving the existing text untouched; returns the URL."""
+
+    def statuses(self, ref: str) -> list[Status]:
+        """The statuses the ticket can be moved to from where it is now, in workflow order."""
+
+    def set_status(self, ref: str, status: Status) -> None:
+        """Move the ticket; raises MissingFieldsError when the workflow wants fields filled in first."""
 
 
 def rank(values: list[tuple[str, str]]) -> list[Choice]:

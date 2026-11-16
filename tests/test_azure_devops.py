@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from tiket.backends import Choice, Details, Draft, MissingFieldsError, Profile
+from tiket.backends import Choice, Details, Draft, MissingFieldsError, Profile, Status
 from tiket.backends.azure_devops import (
     ACCEPTANCE,
     PRIORITY,
@@ -483,3 +483,49 @@ def test_append_description_to_empty_field(ado):
     patch = respx.patch(f"{ORG}/_apis/wit/workitems/42").respond(json={"id": 42})
     ado.append_description(ado_ticket(), "new")
     assert body(patch.calls.last.request)[1]["value"] == "<p>new</p>"
+
+
+# --- status ---------------------------------------------------------------------
+
+STATES = [
+    {"name": "New", "category": "Proposed"},
+    {"name": "Active", "category": "InProgress"},
+    {"name": "Resolved", "category": "Resolved"},
+    {"name": "Closed", "category": "Completed"},
+    {"name": "Hylätty", "category": "Removed"},
+]
+
+
+def mock_item_and_type(state, transitions=None):
+    respx.get(f"{ORG}/_apis/wit/workitems/42").respond(
+        json={"id": 42, "fields": {"System.WorkItemType": "User Story", "System.TeamProject": "Esko Two", "System.State": state}}
+    )
+    return respx.get(f"{ORG}/Esko%20Two/_apis/wit/workitemtypes/User%20Story").respond(
+        json={"name": "User Story", "states": STATES, "transitions": transitions}
+    )
+
+
+@respx.mock
+def test_statuses_are_the_types_other_states(ado):
+    mock_item_and_type("Active")
+    assert ado.statuses("42") == [
+        Status("New", "New"),
+        Status("Resolved", "Resolved"),
+        Status("Closed", "Closed", done=True),
+        Status("Hylätty", "Hylätty", done=True),  # done by category, whatever the process calls it
+    ]
+
+
+@respx.mock
+def test_statuses_follow_the_workflows_transitions(ado):
+    mock_item_and_type("New", {"New": [{"to": "Active"}, {"to": "Hylätty"}, {"to": "New"}], "Active": [{"to": "Closed"}]})
+    assert [s.name for s in ado.statuses("42")] == ["Active", "Hylätty"]
+
+
+@respx.mock
+def test_set_status_patches_the_state(ado):
+    patch = respx.patch(f"{ORG}/_apis/wit/workitems/42").respond(json={"id": 42})
+    ado.set_status("42", Status("Closed", "Closed", done=True))
+    request = patch.calls.last.request
+    assert request.headers["Content-Type"] == "application/json-patch+json"
+    assert body(request) == [{"op": "add", "path": "/fields/System.State", "value": "Closed"}]

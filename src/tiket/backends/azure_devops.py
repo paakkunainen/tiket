@@ -16,6 +16,7 @@ from .base import (
     Item,
     MissingFieldsError,
     Profile,
+    Status,
     Ticket,
     html_to_text,
     rank,
@@ -436,6 +437,40 @@ class AzureDevOpsBackend:
             headers={"Content-Type": "application/json-patch+json"},
         )
         return ticket.url
+
+    # --- status -----------------------------------------------------------------
+
+    def statuses(self, ref: str) -> list[Status]:
+        f = self._req(
+            "GET",
+            f"/_apis/wit/workitems/{ref}",
+            params={"fields": "System.WorkItemType,System.TeamProject,System.State"},
+        )["fields"]
+        kind = self._req(
+            "GET",
+            f"/{quote(f['System.TeamProject'])}/_apis/wit/workitemtypes/{quote(f['System.WorkItemType'])}",
+        )
+        current = f["System.State"]
+        states = [s for s in kind.get("states") or [] if s["name"] != current]
+        # Only the states the workflow allows from here, when the process says which those are
+        if allowed := {t["to"] for t in (kind.get("transitions") or {}).get(current) or []}:
+            states = [s for s in states if s["name"] in allowed]
+        return [
+            Status(
+                name=s["name"],
+                value=s["name"],
+                done=s.get("category") in ("Completed", "Removed") or s["name"] in DONE_STATES,
+            )
+            for s in states
+        ]
+
+    def set_status(self, ref: str, status: Status) -> None:
+        self._req(
+            "PATCH",
+            f"/_apis/wit/workitems/{ref}",
+            json=[{"op": "add", "path": "/fields/System.State", "value": status.value}],
+            headers={"Content-Type": "application/json-patch+json"},
+        )
 
     def _comments(self, project: str, wid: int) -> list[Comment]:
         comments: list[Comment] = []

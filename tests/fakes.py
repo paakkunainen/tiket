@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from tiket.backends import Choice, Created, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update
+from tiket.backends import Choice, Created, Draft, Example, Item, MissingFieldsError, Profile, Status, Ticket, Update
 
 
 @dataclass
@@ -22,6 +22,16 @@ class FakeBackend:
     created: list[tuple[Draft, dict]] = field(default_factory=list)
     calls: list = field(default_factory=list)
     updates: list[tuple[str, str, str]] = field(default_factory=list)  # (target, ref, text)
+    available: list[Status] = field(
+        default_factory=lambda: [
+            Status("In Progress", "11"),
+            Status("In Review", "21"),
+            Status("Done", "31", done=True),
+            Status("Done", "41", done=True, via="Won't do"),
+        ]
+    )
+    moves: list[tuple[str, Status]] = field(default_factory=list)  # (ref, status)
+    move_error: Exception | None = None
 
     def check(self):
         if self.fail:
@@ -78,6 +88,14 @@ class FakeBackend:
     def append_description(self, ticket, text):
         self.updates.append(("description", ticket.ref, text))
         return ticket.url
+
+    def statuses(self, ref):
+        return self.available
+
+    def set_status(self, ref, status):
+        if self.move_error:
+            raise self.move_error
+        self.moves.append((ref, status))
 
 
 class FakeUpdateModel:

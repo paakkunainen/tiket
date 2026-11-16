@@ -8,8 +8,11 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Footer, Header, Input
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Input, OptionList
+from textual.widgets.option_list import Option
 
+from .backends import MissingFieldsError, Status
 from .clipboard import copy_to_clipboard
 
 
@@ -46,7 +49,9 @@ class TaskTable(DataTable):
         Binding("y", "yank", "yank key+title"),
         Binding("Y", "yank_url", "yank url"),
         Binding("c", "yank_context", "copy full ticket"),
+        Binding("s", "status", "status"),
         Binding("o", "open", "open"),
+        Binding("r", "refresh", "refresh"),
         Binding("slash", "filter", "filter"),
         Binding("q", "app.quit", "quit"),
         Binding("escape", "clear_filter", "clear filter", show=False),
@@ -74,6 +79,13 @@ class TaskTable(DataTable):
         if row := self.app.current():
             self.app.yank_context(row)
 
+    def action_status(self) -> None:
+        if row := self.app.current():
+            self.app.pick_status(row)
+
+    def action_refresh(self) -> None:
+        self.app.refresh_rows()
+
     def action_open(self) -> None:
         if row := self.app.current():
             webbrowser.open(row.url)
@@ -92,6 +104,39 @@ class FilterInput(Input):
         self.app.hide_filter(clear=True)
 
 
+class StatusPicker(ModalScreen[Status | None]):
+    """The statuses the ticket can move to; enter picks one, esc leaves it as it is."""
+
+    BINDINGS = [
+        Binding("j", "move(1)", "down", show=False),
+        Binding("k", "move(-1)", "up", show=False),
+        Binding("escape", "dismiss(None)", "cancel"),
+        Binding("q", "dismiss(None)", "cancel", show=False),
+    ]
+    DEFAULT_CSS = """
+    StatusPicker { align: center middle; }
+    StatusPicker OptionList { width: auto; min-width: 36; max-width: 80%; height: auto; max-height: 80%; padding: 0 1; }
+    """
+
+    def __init__(self, row: TaskRow, statuses: list[Status]):
+        super().__init__()
+        self.row = row
+        self.statuses = statuses
+
+    def compose(self) -> ComposeResult:
+        options = OptionList(*(Option(s.label) for s in self.statuses))
+        options.border_title = f"{self.row.key}: {self.row.status} →"
+        options.border_subtitle = "enter move · esc cancel"
+        yield options
+
+    def action_move(self, step: int) -> None:
+        options = self.query_one(OptionList)
+        options.action_cursor_down() if step > 0 else options.action_cursor_up()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.statuses[event.option_index])
+
+
 class TaskBrowser(App):
     TITLE = "tiket tasks"
     CSS = """
@@ -105,9 +150,15 @@ class TaskBrowser(App):
         rows: list[TaskRow],
         note: str = "",
         fetch: Callable[[TaskRow], tuple[str, str]] | None = None,
+        statuses: Callable[[TaskRow], list[Status]] | None = None,
+        move: Callable[[TaskRow, Status], None] | None = None,
+        reload: Callable[[], tuple[list[TaskRow], str]] | None = None,
     ):
         super().__init__()
         self.fetch = fetch  # row -> (markdown, short summary) for the "copy full ticket" key
+        self.statuses = statuses  # row -> where the ticket can move to, for the "status" key
+        self.move = move  # (row, status) -> moves the ticket
+        self.reload = reload  # () -> (rows, note), fetched again for the "refresh" key
         self.all_rows = rows
         self.shown: list[TaskRow] = rows
         self.filter_text = ""
@@ -201,6 +252,69 @@ class TaskBrowser(App):
             self.call_from_thread(self.notify, str(e), title=row.key, severity="error")
             return
         self.call_from_thread(self.yank, text, summary)
+
+    @work(thread=True, exclusive=True, group="refresh")
+    def refresh_rows(self) -> None:
+        if not self.reload:
+            return
+        self.call_from_thread(self.notify, "Refreshing…", timeout=2)
+        try:
+            rows, note = self.reload()
+        except Exception as e:
+            self.call_from_thread(self.notify, str(e), title="Refresh failed", severity="error", timeout=8)
+            return
+        self.call_from_thread(self.refreshed, rows, note)
+
+    def refreshed(self, rows: list[TaskRow], note: str) -> None:
+        self.all_rows, self.note = rows, note
+        self.rebuild()  # keeps the filter, and the cursor on the same ticket if it is still there
+        self.notify(f"{len(rows)} tickets", title="Refreshed", timeout=2)
+
+    @work(thread=True, exclusive=True, group="status")
+    def pick_status(self, row: TaskRow) -> None:
+        if not (self.statuses and self.move):
+            return
+        self.call_from_thread(self.notify, f"Reading the workflow of {row.key}…", timeout=2)
+        try:
+            options = self.statuses(row)
+        except Exception as e:
+            self.call_from_thread(self.notify, str(e), title=row.key, severity="error")
+            return
+        if not options:
+            self.call_from_thread(
+                self.notify, f"{row.status}: can't be moved anywhere from here", title=row.key, severity="warning"
+            )
+            return
+
+        def picked(status: Status | None) -> None:
+            if status:
+                self.move_to(row, status)
+
+        self.call_from_thread(self.push_screen, StatusPicker(row, options), picked)
+
+    @work(thread=True, group="status")
+    def move_to(self, row: TaskRow, status: Status) -> None:
+        try:
+            self.move(row, status)
+        except MissingFieldsError as e:
+            needs = ", ".join(label for _, label in e.fields)
+            self.call_from_thread(
+                self.notify,
+                f"{status.name} asks for {needs}. Press o to do it in the browser.",
+                title=row.key,
+                severity="error",
+                timeout=8,
+            )
+            return
+        except Exception as e:
+            self.call_from_thread(self.notify, str(e), title=row.key, severity="error", timeout=8)
+            return
+        self.call_from_thread(self.moved, row, status)
+
+    def moved(self, row: TaskRow, status: Status) -> None:
+        was, row.status, row.done, row.updated = row.status, status.name, status.done, "today"
+        self.rebuild()
+        self.notify(f"{was} → {status.name}", title=row.key, timeout=3)
 
     def set_filter(self, text: str) -> None:
         self.filter_text = text

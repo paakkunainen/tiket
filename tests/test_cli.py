@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from fakes import FakeBackend, FakeModel, FakeUpdateModel
 from tiket import cli
-from tiket.backends import Choice, Comment, Details, Draft, Example, Item, Ticket, Update
+from tiket.backends import Choice, Comment, Details, Draft, Example, Item, MissingFieldsError, Status, Ticket, Update
 from tiket.config import ConfigError
 
 runner = CliRunner()
@@ -499,6 +499,28 @@ def test_tasks_one_failing_site_still_shows_others(items, monkeypatch):
     assert keys(result.output) == ["BI-10", "BI-9", "17", "X-1"]
 
 
+def test_tasks_interactive_view_gets_rows_and_a_reload(items, monkeypatch):
+    from tiket import tui
+
+    made = {}
+
+    class Browser:
+        def __init__(self, rows, **kw):
+            made.update(rows=rows, **kw)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(tui, "TaskBrowser", Browser)
+    monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+    assert run("tasks", "bf").exit_code == 0
+    assert [r.key for r in made["rows"]] == ["BI-10", "BI-9"] and made["note"] == ""
+    before = len(items)
+    rows, note = made["reload"]()  # r in the view: the same queries again
+    assert [(r.key, r.project, r.site) for r in rows] == [("BI-10", "bf", "cloud"), ("BI-9", "bf", "cloud")] and note == ""
+    assert len(items) == before + 1
+
+
 def test_tasks_nothing_found(backend):
     result = run("tasks", "-p")
     assert result.exit_code == 0 and "No tickets found" in result.output
@@ -742,6 +764,89 @@ def test_update_is_a_subcommand_not_an_alias(shown, writer, monkeypatch):
 
 
 # --- other commands -----------------------------------------------------------
+
+# --- status -------------------------------------------------------------------
+
+def test_status_moves_by_name(shown):
+    result = run("status", "BI-5", "in", "review")
+    assert result.exit_code == 0, result.output
+    assert shown.moves == [("BI-5", Status("In Review", "21"))]
+    assert "BI-5 Open → In Review" in flat(result.output)
+
+
+@pytest.mark.parametrize(
+    "wanted, value",
+    [
+        ("DONE", "31"),  # two transitions lead to Done: the plain one wins
+        ("won't do", "41"),  # …and the other is reached by its transition name
+        ("in p", "11"),  # unique prefix
+        ("review", "21"),  # unique part
+        ("wont", None),
+    ],
+)
+def test_status_matching(shown, wanted, value):
+    result = run("status", "BI-5", wanted)
+    assert [s.value for _, s in shown.moves] == ([value] if value else [])
+    if not value:
+        assert result.exit_code == 2
+        assert "BI-5 is Open and can't be moved to 'wont'. Available: In Progress, In Review, Done, Done (Won't do)" in flat(result.output)
+
+
+def test_status_ambiguous(shown):
+    result = run("status", "BI-5", "in")
+    assert result.exit_code == 2 and shown.moves == []
+    assert "'in' fits several: In Progress, In Review" in flat(result.output)
+
+
+def test_status_already_there(shown):
+    result = run("status", "BI-5", "open")
+    assert result.exit_code == 0 and shown.moves == []
+    assert "BI-5 is already Open" in result.output
+
+
+def test_status_without_target_lists_and_picks(shown, monkeypatch):
+    result = run("status", "BI-5")  # piped: just the list
+    assert result.exit_code == 0 and shown.moves == []
+    assert "BI-5 Broken: Open" in result.output and "4) Done (Won't do)" in result.output
+
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    assert run("status", "BI-5", input="\n").exit_code == 0
+    assert shown.moves == []  # enter leaves it
+    result = run("status", "BI-5", input="3\n")
+    assert [s.value for _, s in shown.moves] == ["31"]
+    assert "Open → Done" in flat(result.output)
+
+
+def test_status_nowhere_to_go(shown):
+    shown.available = []
+    assert "can't be moved anywhere" in run("status", "BI-5").output
+    result = run("status", "BI-5", "done")
+    assert result.exit_code == 2 and "Available: nothing" in flat(result.output)
+
+
+def test_status_json(shown):
+    data = json.loads(run("status", "BI-5", "--json").stdout)
+    assert data["status"] == "Open" and data["available"][3] == {"name": "Done", "via": "Won't do", "done": True}
+    data = json.loads(run("status", "BI-5", "done", "--json").stdout)
+    assert data == {"ref": "BI-5", "url": TICKET.url, "from": "Open", "status": "Done", "changed": True}
+    data = json.loads(run("status", "BI-5", "open", "--json").stdout)
+    assert data["changed"] is False and data["status"] == "Open"
+
+
+def test_status_workflow_wants_fields(shown):
+    shown.move_error = MissingFieldsError([("resolution", "Resolution")], "raw")
+    result = run("status", "BI-5", "done")
+    assert result.exit_code == 1
+    assert "workflow asks for Resolution" in flat(result.output) and TICKET.url in flat(result.output)
+
+
+def test_status_is_a_subcommand_and_finds_ado_ids(shown, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["tiket", "status", "42", "done"])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 0 and shown.made == [("ado", None)]
+    assert [s.value for _, s in shown.moves] == ["31"]
+
 
 def test_projects_command(backend):
     result = run("projects", "cloud")

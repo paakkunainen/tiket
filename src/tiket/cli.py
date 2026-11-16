@@ -21,7 +21,7 @@ from rich.table import Table
 from . import aliases, editor
 from . import details as ticket_details
 from . import llm, style_cache
-from .backends import Backend, Details, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update, make_backend
+from .backends import Backend, Details, Draft, Example, Item, MissingFieldsError, Profile, Status, Ticket, Update, make_backend
 from .clipboard import copy_to_clipboard, paste_from_clipboard
 from .config import ConfigError, Site, load_config, load_sites
 
@@ -44,6 +44,7 @@ tiket                                      # pick project, then describe
 tiket tasks                                # browse your tickets, y = copy
 tiket show TIJOFI-5173 -c                  # copy ticket + comments
 tiket update BI-2314 -p                    # add notes as comment/description
+tiket status BI-2314 done                  # move a ticket to another status
 tiket alias                                # manage project aliases
 tiket doctor                               # check Ollama and credentials
 ```
@@ -75,7 +76,7 @@ TYPE_SYNONYMS |= {
     "tarina": TYPE_SYNONYMS["story"],
     "parannus": TYPE_SYNONYMS["improvement"],
 }
-SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "show", "update", "alias", "config"}
+SUBCOMMANDS = {"new", "list", "projects", "doctor", "tasks", "show", "update", "status", "alias", "config"}
 # Work item types that are never a sensible target or style example for a quick ticket
 IGNORED_TYPES = {
     "Test Case",
@@ -338,7 +339,8 @@ j / k, arrows     move              y        copy "KEY Title"
 g / G             first / last      Y        copy the URL
 ctrl-d / ctrl-u   half page         c        copy full ticket as markdown
 /                 filter            o, enter open in browser
-q                 quit              esc      clear filter
+s                 change status     esc      clear filter
+r                 refresh           q        quit
 ```
 
 **Examples**
@@ -378,7 +380,8 @@ def tasks(
 ):
     """Browse the tickets assigned to you on every board.
 
-    Opens an interactive list with vim keys; **y** copies "KEY Title" to the clipboard.
+    Opens an interactive list with vim keys; **y** copies "KEY Title" to the clipboard, **s**
+    moves the selected ticket to another status and **r** fetches the list again.
     """
     if sort not in TASK_SORTS:
         _die(f"Unknown sort '{sort}'. Use one of: {', '.join(TASK_SORTS)}")
@@ -405,43 +408,47 @@ def tasks(
         except Exception as e:  # one broken site shouldn't hide the others
             return site, e
 
+    alias_of = {(p.site.name, p.project.lower()): a for a, p in cfg.projects.items()}
+
+    def load() -> tuple[list[tuple[str, Item]], dict[str, Exception]]:
+        """(project label, ticket) rows in display order, and the sites that failed."""
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(run, queries))
+        rows: list[tuple[str, Item]] = []
+        seen: set[str] = set()
+        failed: dict[str, Exception] = {}
+        for site, result in results:
+            if isinstance(result, Exception):
+                failed[site] = result
+                continue
+            for item in result:
+                item.site = site
+                if item.url not in seen:
+                    seen.add(item.url)
+                    rows.append(
+                        (alias_of.get((site, item.project.lower()), item.project), item)
+                    )
+        # Newest change first, then a stable sort on the chosen column keeps that as the tiebreak
+        rows.sort(key=lambda r: r[1].updated, reverse=True)
+        if sort != "updated":
+            rows.sort(key=lambda r: TASK_SORTS[sort](r[0], r[1]))
+        return rows, failed
+
     with console.status(
         f"Fetching your tickets from {len({s for s, _ in queries})} site(s)…"
     ):
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(run, queries))
-
-    alias_of = {(p.site.name, p.project.lower()): a for a, p in cfg.projects.items()}
-    rows: list[tuple[str, Item]] = []
-    seen: set[str] = set()
-    failed: list[str] = []
-    for site, result in results:
-        if isinstance(result, Exception):
-            console.print(f"[yellow]{site}: {result}[/]")
-            failed.append(site)
-            continue
-        for item in result:
-            item.site = site
-            if item.url not in seen:
-                seen.add(item.url)
-                rows.append(
-                    (alias_of.get((site, item.project.lower()), item.project), item)
-                )
+        rows, failed = load()
+    for site, error in failed.items():
+        console.print(f"[yellow]{site}: {error}[/]")
     if not rows:
         console.print("[dim]No tickets found.[/]")
         return
 
-    # Newest change first, then a stable sort on the chosen column keeps that as the tiebreak
-    rows.sort(key=lambda r: r[1].updated, reverse=True)
-    if sort != "updated":
-        rows.sort(key=lambda r: TASK_SORTS[sort](r[0], r[1]))
-
-    if not plain and sys.stdin.isatty() and sys.stdout.isatty():
+    if not plain and _is_interactive():
         from .tui import TaskBrowser, TaskRow
 
-        note = f" · ⚠ failed: {', '.join(failed)}" if failed else ""
-        TaskBrowser(
-            [
+        def view(rows: list[tuple[str, Item]], failed: dict[str, Exception]) -> tuple[list, str]:
+            task_rows = [
                 TaskRow(
                     item.ref,
                     item.title,
@@ -454,11 +461,19 @@ def tasks(
                     item.site,
                 )
                 for label, item in rows
-            ],
+            ]
+            return task_rows, f" · ⚠ failed: {', '.join(failed)}" if failed else ""
+
+        task_rows, note = view(rows, failed)
+        TaskBrowser(
+            task_rows,
             note=note,
+            reload=lambda: view(*load()),
             fetch=lambda row: _ticket_summary(
                 make_backend(sites[row.site]).ticket(row.key)
             ),
+            statuses=lambda row: make_backend(sites[row.site]).statuses(row.key),
+            move=lambda row, status: make_backend(sites[row.site]).set_status(row.key, status),
         ).run()
         return
 
@@ -696,6 +711,125 @@ def update(
     console.print(f"[bold green]{done}[/] {ticket.ref}: {url}")
 
 
+@app.command(
+    epilog="""**Examples**
+
+```
+tiket status BI-2314               # list the options, pick one
+tiket status BI-2314 done          # move it
+tiket status BI-2314 in progress   # quotes are optional
+tiket status 258694 act            # a unique part of the name is enough
+tiket status BI-2314 --json        # the options as JSON; with a status, the result
+```
+
+In `tiket tasks`, **s** does the same for the selected row.
+"""
+)
+@_json_aware
+def status(
+    ref: str = typer.Argument(
+        ..., help="Jira key (BI-123), Azure DevOps id (258694) or the ticket's URL"
+    ),
+    to: list[str] = typer.Argument(
+        None, help="The status to move to (name or a unique part of it); omit to see the options"
+    ),
+    where: str = typer.Option(
+        None, "--in", "-i", help="Alias or site to look in (see `tiket show -h`)"
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the options or the result as JSON; messages go to stderr"
+    ),
+):
+    """Change a ticket's status, e.g. to In Progress or Done.
+
+    Only the statuses the ticket's workflow allows from where it is now are offered. Without a
+    status you get the list, and can pick one by number.
+    """
+    ticket, backend = _locate_ticket(ref, where)
+    with console.status(f"Reading the workflow of {ticket.ref}…"):
+        available = backend.statuses(ticket.ref)
+    wanted = " ".join(to or []).strip()
+
+    if not wanted:
+        if as_json:
+            _print_json({
+                "ref": ticket.ref,
+                "url": ticket.url,
+                "status": ticket.status,
+                "available": [{"name": s.name, "via": s.via, "done": s.done} for s in available],
+            })
+            return
+        console.print(f"[bold]{ticket.ref}[/] {_clip_title(ticket.title)}: [bold]{ticket.status}[/]")
+        if not available:
+            console.print("[dim]It can't be moved anywhere from here.[/]")
+            return
+        for i, s in enumerate(available, 1):
+            console.print(f"  [bold]{i}[/]) {s.label}")
+        if not _stdin_is_tty():
+            return
+        choice = Prompt.ask(
+            "Move to [dim](number, enter to leave it)[/]",
+            choices=[str(i) for i in range(1, len(available) + 1)] + [""],
+            default="",
+            show_choices=False,
+            show_default=False,
+        )
+        if not choice:
+            return
+        target = available[int(choice) - 1]
+    else:
+        target = _match_status(wanted, available)
+        if target is None:
+            if wanted.lower() == ticket.status.lower():
+                if as_json:
+                    _print_json(_status_result(ticket, ticket.status, None))
+                else:
+                    console.print(f"[dim]{ticket.ref} is already {ticket.status}.[/]")
+                return
+            options = ", ".join(s.label for s in available) or "nothing"
+            _die(f"{ticket.ref} is {ticket.status} and can't be moved to '{wanted}'. Available: {options}")
+
+    try:
+        with console.status(f"Moving {ticket.ref} to {target.name}…"):
+            backend.set_status(ticket.ref, target)
+    except MissingFieldsError as e:
+        console.print(
+            f"[red]{ticket.ref} can't be moved to {target.name} from here: the workflow asks for "
+            f"{', '.join(label for _, label in e.fields)}.[/] Do it in the browser: {ticket.url}"
+        )
+        raise typer.Exit(1)
+    if as_json:
+        _print_json(_status_result(ticket, target.name, target))
+        return
+    console.print(f"[bold green]{ticket.ref}[/] {ticket.status} → [bold]{target.name}[/]  {ticket.url}")
+
+
+def _status_result(ticket: Ticket, now: str, moved: Status | None) -> dict:
+    return {"ref": ticket.ref, "url": ticket.url, "from": ticket.status, "status": now, "changed": moved is not None}
+
+
+def _match_status(wanted: str, available: list[Status]) -> Status | None:
+    """Exact name first, then a unique prefix, then a unique part; None when nothing fits."""
+    key = wanted.lower()
+    tests = [
+        lambda text: text == key,
+        lambda text: text.startswith(key),
+        lambda text: key in text,
+    ]
+    for test in tests:
+        # the status name wins over the name of a transition into some other status
+        for texts in (lambda s: [s.name], lambda s: [s.via, s.label]):
+            found = [s for s in available if any(test(t.lower()) for t in texts(s) if t)]
+            if len(found) > 1 and len({s.name for s in found}) == 1:
+                # several ways into the same status: take the plain one if there is one
+                found = [s for s in found if not s.via] or found
+            if len(found) == 1:
+                return found[0]
+            if found:
+                _die(f"'{wanted}' fits several: {', '.join(s.label for s in found)}. Be more specific.")
+    return None
+
+
 def _save(path: Path | None, state: dict) -> None:
     if path:
         path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
@@ -906,6 +1040,10 @@ def _read_description(text: list[str], paste: bool, prompt: str = "Describe the 
         )
         parts.append(sys.stdin.read())
     return "\n\n".join(p.strip() for p in parts if p.strip())
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _stdin_is_tty() -> bool:

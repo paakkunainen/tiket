@@ -11,6 +11,7 @@ from .base import (
     Item,
     MissingFieldsError,
     Profile,
+    Status,
     Ticket,
     Update,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "Item",
     "MissingFieldsError",
     "Profile",
+    "Status",
     "Ticket",
     "Update",
     "make_backend",

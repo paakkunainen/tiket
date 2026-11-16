@@ -13,6 +13,7 @@ from .base import (
     Item,
     MissingFieldsError,
     Profile,
+    Status,
     Ticket,
     html_to_text,
     rank,
@@ -500,6 +501,40 @@ class JiraBackend:
         description = (current.rstrip() + "\n\n" if current.strip() else "") + md_to_jira(text)
         self._req("PUT", f"/rest/api/2/issue/{ticket.ref}", json={"fields": {"description": description}})
         return ticket.url
+
+    # --- status -----------------------------------------------------------------
+
+    def statuses(self, ref: str) -> list[Status]:
+        data = self._req(
+            "GET",
+            f"/rest/api/2/issue/{ref.upper()}",
+            params={"fields": "status", "expand": "transitions"},
+        )
+        current = data["fields"]["status"]["name"]
+        return [
+            Status(
+                name=to["name"],
+                value=t["id"],
+                done=(to.get("statusCategory") or {}).get("key") == "done",
+                via="" if t["name"].lower() == to["name"].lower() else t["name"],
+            )
+            for t in data.get("transitions", [])
+            for to in [t["to"]]
+            if to["name"] != current  # workflows with "any status → X" transitions offer the current one too
+        ]
+
+    def set_status(self, ref: str, status: Status) -> None:
+        path = f"/rest/api/2/issue/{ref.upper()}/transitions"
+        r = self.http.post(path, json={"transition": {"id": status.value}})
+        if r.status_code == 400:
+            try:
+                errors = r.json().get("errors") or {}
+            except ValueError:
+                errors = {}
+            if errors:  # the transition has a screen with required fields, e.g. a resolution
+                raise MissingFieldsError(list(errors.items()), r.text)
+        if r.is_error:
+            raise RuntimeError(f"Jira POST {path} -> {r.status_code}: {r.text[:1000]}")
 
     def _issue_label(self, key: str) -> str:
         try:

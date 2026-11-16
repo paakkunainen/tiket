@@ -16,6 +16,7 @@ tiket <alias> "..." -D                       # don't guess details (parent, poin
 tiket tasks                                  # my open tickets on every board, grouped by project
                                              #   j/k g/G ctrl-d/u move · y yank "KEY Title" · Y yank url
                                              #   c copy full ticket + comments as markdown
+                                             #   s change the ticket's status · r refresh the list
                                              #   o/enter open in browser · / filter · esc clear · q quit
 tiket tasks --plain                          # print a table instead (also automatic when piped)
 tiket tasks -o updated                       # order by: project (default), updated, key, type, status
@@ -27,6 +28,8 @@ tiket show 258694 > ticket.md                # piped = plain markdown; --json fo
 tiket update BI-2314 "new info"              # add to a ticket: the model writes a comment or a
                                              # section appended to the description (-c / -d force)
 tiket update BI-2314 -p                      # …from the clipboard; preview y/r/s(witch)/e/n
+tiket status BI-2314                         # where the ticket is and where it can go; pick one
+tiket status BI-2314 in progress             # move it (a unique part of the name is enough)
 tiket alias                                  # list aliases; add / rename / set / remove (see -h)
 tiket alias add jod eduuni OPHJOD            # checks the project exists, shows its issue types
 tiket alias rename tijo omaolo
@@ -55,6 +58,14 @@ Besides the text, `tiket` fills in the parent/epic, story points, priority, comp
 
 Press `s` in the preview to switch between the two, or force one with `-c` / `-d`.
 
+## Changing a ticket's status
+
+`tiket status <key|id|url>` shows the ticket's status and the statuses its workflow allows from there (Jira: the available transitions; Azure DevOps: the work item type's states), and you pick one by number. `tiket status BI-2314 done` moves it directly: the name is matched without regard to case, and a unique beginning or part of it is enough (`tiket status 258694 act`). When a Jira transition is named differently from its status, it is shown in brackets, e.g. `Done (Won't do)`, and that name works too. `--json` prints the options or the result.
+
+In `tiket tasks`, `s` opens the same list for the selected row (j/k and enter to move the ticket, esc to cancel); the row is updated in place.
+
+If the workflow wants fields filled in on the way (a resolution, say), tiket tells you which and leaves the ticket alone; do that move in the browser.
+
 ## Using tiket from Claude Code
 
 `skills/tiket/SKILL.md` teaches Claude Code to read tickets for context and to create or update
@@ -78,7 +89,7 @@ In `~/.claude/settings.json`:
 ```json
 "permissions": {
   "allow": ["Bash(tiket show:*)", "Bash(tiket tasks:*)", "Bash(COLUMNS=200 tiket tasks:*)", "Bash(tiket alias list)"],
-  "ask":   ["Bash(tiket new:*)", "Bash(tiket update:*)"]
+  "ask":   ["Bash(tiket new:*)", "Bash(tiket update:*)", "Bash(tiket status:*)"]
 }
 ```
 

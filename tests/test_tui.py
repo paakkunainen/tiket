@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from tiket import clipboard, tui
+from tiket.backends import MissingFieldsError, Status
 from tiket.tui import TaskBrowser, TaskRow
 
 
@@ -34,7 +35,12 @@ def drive(app: TaskBrowser, *keys: str, size=(120, 30)):
 
     async def go():
         async with app.run_test(size=size) as pilot:
-            await pilot.press(*keys)
+            for key in keys:
+                if key == "wait":  # let a background fetch finish before the next key
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                else:
+                    await pilot.press(key)
             await app.workers.wait_for_complete()
             await pilot.pause()
             app.final_columns = [str(c.label) for c in app.table.columns.values()]
@@ -121,6 +127,95 @@ def test_copy_full_ticket_failure_copies_nothing(clip):
 
     drive(TaskBrowser(rows(), fetch=fetch), "c")
     assert clip == []
+
+
+STATUSES = [Status("In Progress", "11", via="Start"), Status("Done", "31", done=True)]
+
+
+def status_app(n=3, statuses=STATUSES, error=None):
+    moves = []
+
+    def move(row, status):
+        if error:
+            raise error
+        moves.append((row.site, row.key, status.value))
+
+    app = TaskBrowser(rows(n), statuses=lambda row: statuses, move=move)
+    app.moves = moves
+    return app
+
+
+def test_status_key_moves_the_selected_ticket(clip):
+    app = drive(status_app(), "j", "s", "wait", "j", "enter", "wait", "y")
+    assert app.moves == [("cloud", "BI-2", "31")]
+    row = app.all_rows[1]
+    assert (row.status, row.done, row.updated) == ("Done", True, "today")
+    assert app.final_row.key == "BI-2"  # the cursor stays on the ticket
+    assert clip == ["BI-2 Title 2"]  # and the table has the keys again
+
+
+def test_status_picker_shows_transition_names_and_vim_keys(clip):
+    app = status_app()
+    labels = []
+
+    async def go():
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.press("s")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            options = app.screen.query_one(tui.OptionList)
+            labels.extend(str(options.get_option_at_index(i).prompt) for i in range(options.option_count))
+            await pilot.press("j", "j", "k", "k", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    asyncio.run(go())
+    assert labels == ["In Progress (Start)", "Done"]
+    assert app.moves == [("cloud", "BI-1", "11")]
+
+
+@pytest.mark.parametrize("cancel", ["escape", "q"])
+def test_status_picker_cancel_changes_nothing(clip, cancel):
+    app = drive(status_app(), "s", "wait", cancel, "y")
+    assert app.moves == [] and app.all_rows[0].status == "Open"
+    assert clip == ["BI-1 Title 1"]  # back on the table, not quit
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("403 no permission"), MissingFieldsError([("resolution", "Resolution")], "raw")]
+)
+def test_status_failure_leaves_the_row_alone(clip, error):
+    app = drive(status_app(error=error), "s", "wait", "enter")
+    assert app.all_rows[0].status == "Open" and app.all_rows[0].done is False
+
+
+def test_status_with_nowhere_to_go_or_no_backend(clip):
+    app = drive(status_app(statuses=[]), "s", "wait", "y")
+    assert app.moves == [] and clip == ["BI-1 Title 1"]  # no picker opened
+    drive(TaskBrowser(rows()), "s", "wait", "y")
+    drive(TaskBrowser([]), "s")
+
+
+def test_refresh_reloads_rows_and_keeps_cursor_and_filter(clip):
+    def reload():
+        fresh = rows(4)[1:]  # BI-1 is gone, BI-4 is new
+        fresh[0].status = "Done"
+        return fresh, " · ⚠ failed: dc"
+
+    app = drive(TaskBrowser(rows(3), reload=reload), "slash", "T", "i", "enter", "j", "r", "wait", "y")
+    assert [r.key for r in app.shown] == ["BI-2", "BI-3", "BI-4"]
+    assert app.final_row.key == "BI-2" and app.final_row.status == "Done"
+    assert clip == ["BI-2 Title 2"]
+    assert app.final_subtitle == "3/3 tickets · filter: 'Ti' · ⚠ failed: dc"
+
+
+def test_refresh_failure_or_no_loader_keeps_rows(clip):
+    def reload():
+        raise RuntimeError("offline")
+
+    app = drive(TaskBrowser(rows(3), reload=reload), "r", "wait", "y")
+    assert len(app.shown) == 3 and clip == ["BI-1 Title 1"]
+    assert len(drive(TaskBrowser(rows(3)), "r").shown) == 3
 
 
 def test_osc52_fallback_without_clipboard_tool(monkeypatch):
