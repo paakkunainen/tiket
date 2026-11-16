@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from . import aliases
+from . import aliases, editor
 from . import details as ticket_details
 from . import llm, style_cache
 from .backends import Backend, Details, Draft, Example, Item, MissingFieldsError, Profile, Ticket, Update, make_backend
@@ -184,7 +184,8 @@ def new(
     the current sprint / iteration and area, with you as the assignee.
 
     You get a preview first: **y** create · **r** rewrite (optionally with feedback such as
-    "shorter") · **e** edit everything in $EDITOR, where `none` clears a detail · **n** cancel.
+    "shorter") · **e** edit title, type, text and details in a form (ctrl+s saves and returns to the
+    preview; `none` clears a detail; uses $EDITOR instead if set) · **n** cancel.
 
     For scripts and agents: **-n --save d.json** previews and keeps the draft, **--from d.json -y**
     creates exactly that draft, and **--json** prints machine-readable output.
@@ -281,17 +282,9 @@ def new(
         if choice == "n":
             raise typer.Exit(1)
         if choice == "e":
-            draft = _edit(draft)
-            _show(draft, project)
-            _save(save, {**state, "draft": draft.to_dict()})
-            if (
-                Prompt.ask(
-                    "[bold]Create edited ticket?[/]", choices=["y", "n"], default="y"
-                )
-                == "y"
-            ):
-                break
-            raise typer.Exit(1)
+            # back to the preview with the edited draft; y then creates it
+            loaded = _edit_draft(draft, creatable, profile, backend.separate_acceptance_criteria)
+            continue
         feedback = (
             Prompt.ask("Feedback for the rewrite (enter to skip)", default="") or None
         )
@@ -615,7 +608,7 @@ def update(
     why; force it with **-c** / **-d**. The existing description is never rewritten.
 
     Preview: **y** write · **r** rewrite (optionally with feedback) · **s** switch comment ↔
-    description · **e** edit in $EDITOR · **n** cancel.
+    description · **e** edit in a form (or $EDITOR if set) · **n** cancel.
 
     For scripts and agents: **-n --save u.json** previews and keeps the addition, **--from u.json -y**
     writes exactly that, and **--json** prints machine-readable output.
@@ -683,12 +676,8 @@ def update(
         if choice == "n":
             raise typer.Exit(1)
         if choice == "e":
-            draft = Update(draft.target, _edit_text(draft.text), draft.reason)
-            _show_update(draft, ticket, chosen=False)
-            _save(save, {**state, "update": dataclasses.asdict(draft)})
-            if Prompt.ask("[bold]Write edited text?[/]", choices=["y", "n"], default="y") == "y":
-                break
-            raise typer.Exit(1)
+            loaded = _edit_update(draft, ticket.ref)
+            continue
         if choice == "s":
             target, feedback = other, None
             draft = None  # a comment and a description section are written differently
@@ -748,13 +737,36 @@ def _clip_title(title: str, n: int = 60) -> str:
     return title if len(title) <= n else title[: n - 1] + "…"
 
 
+def _external_editor() -> str | None:
+    """$VISUAL / $EDITOR if set; otherwise tiket's own form is used."""
+    return os.environ.get("VISUAL") or os.environ.get("EDITOR")
+
+
+def _edit_update(draft: Update, ref: str) -> Update:
+    if _external_editor():
+        return Update(draft.target, _edit_text(draft.text), draft.reason)
+    edited = editor.edit_update(draft, ref)
+    if edited is None:
+        console.print("[dim]Edit cancelled, nothing changed.[/]")
+    return edited or draft
+
+
+def _edit_draft(draft: Draft, types: list[str], profile: Profile, show_ac: bool) -> Draft:
+    if _external_editor():
+        return _edit(draft)
+    edited = editor.edit_draft(draft, types, profile, show_ac)
+    if edited is None:
+        console.print("[dim]Edit cancelled, nothing changed.[/]")
+    return edited or draft
+
+
 def _edit_text(text: str) -> str:
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    command = _external_editor()
     with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as f:
         f.write(text + "\n")
         path = f.name
     try:
-        subprocess.run(f'{editor} "{path}"', shell=True, check=True)
+        subprocess.run(f'{command} "{path}"', shell=True, check=True)
         return open(path).read().strip()
     finally:
         os.unlink(path)
@@ -945,7 +957,7 @@ def _show(draft: Draft, project) -> None:
 
 
 def _edit(draft: Draft) -> Draft:
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    command = _external_editor()
     with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as f:
         f.write(
             f"Type: {draft.issue_type}\nTitle: {draft.title}\n"
@@ -955,7 +967,7 @@ def _edit(draft: Draft) -> Draft:
             f.write(f"\n{AC_MARKER}\n{draft.acceptance_criteria}\n")
         path = f.name
     try:
-        subprocess.run(f'{editor} "{path}"', shell=True, check=True)
+        subprocess.run(f'{command} "{path}"', shell=True, check=True)
         content = open(path).read()
     finally:
         os.unlink(path)

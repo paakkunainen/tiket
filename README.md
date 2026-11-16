@@ -40,7 +40,7 @@ Setup: `uv tool install -e .`. The config lives in `config.toml`, which is symli
 
 ## Ticket details
 
-Besides the text, `tiket` fills in the parent/epic, story points, priority, components, labels, the current sprint (Azure DevOps: iteration and area) and makes you the assignee. The candidates come from your own ~50 most recent tickets in that project; the model picks among them based on the ticket's content (closed parents are skipped). The current sprint is looked up on every run: the active sprint on the board you last used, otherwise the next one. Everything is shown in the preview and can be changed with `e`. Any parent key or sprint id can be typed there, and `none` clears a field. If the tracker rejects a guessed detail, the ticket is still created and you get a warning.
+Besides the text, `tiket` fills in the parent/epic, story points, priority, components, labels, the current sprint (Azure DevOps: iteration and area) and makes you the assignee. The candidates come from your own ~50 most recent tickets in that project; the model picks among them based on the ticket's content (closed parents are skipped). The current sprint is looked up on every run: the active sprint on the board you last used, otherwise the next one. Everything is shown in the preview and can be changed with `e`, which opens a form for the type, title, text and details (tab moves between fields, → accepts a suggestion, **ctrl+s** saves and returns to the preview, where `y` creates the edited ticket; if `$EDITOR` is set, that editor is used instead). Any parent key or sprint id can be typed there, and `none` clears a field. If the tracker rejects a guessed detail, the ticket is still created and you get a warning.
 
 ## Ticket context for agents
 

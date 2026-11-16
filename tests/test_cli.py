@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from fakes import FakeBackend, FakeModel, FakeUpdateModel
 from tiket import cli
-from tiket.backends import Choice, Comment, Details, Draft, Example, Item, Ticket
+from tiket.backends import Choice, Comment, Details, Draft, Example, Item, Ticket, Update
 from tiket.config import ConfigError
 
 runner = CliRunner()
@@ -119,6 +119,45 @@ def test_new_edit_in_editor(backend, model, tmp_path, monkeypatch):
     draft = backend.created[0][0]
     assert (draft.title, draft.issue_type, draft.description) == ("New title", "Bug", "New body")
     assert draft.details.parent is None and draft.details.labels == ["x", "y"]
+
+
+def test_new_edit_in_form_then_create(backend, model, monkeypatch):
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    seen = []
+
+    def form(draft, types, profile, show_ac):
+        seen.append((types, show_ac))
+        return Draft("Edited in form", draft.description, "Bug", details=draft.details)
+
+    monkeypatch.setattr(cli.editor, "edit_draft", form)
+    result = run("new", "bf", "x", input="e\ny\n")
+    assert result.exit_code == 0, result.output
+    assert seen == [(["Task", "Bug"], False)]  # creatable types only (no Epic / Sub-task)
+    assert backend.created[0][0].title == "Edited in form"
+    assert result.output.count("Create?") == 2  # back at the normal preview after editing
+    assert len(model.calls) == 1
+
+
+def test_new_edit_in_form_cancelled_keeps_draft(backend, model, monkeypatch):
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    monkeypatch.setattr(cli.editor, "edit_draft", lambda *a: None)
+    result = run("new", "bf", "x", input="e\ny\n")
+    assert "Edit cancelled" in result.output
+    assert backend.created[0][0].title == "Generated title"
+
+
+def test_update_edit_in_form(shown, monkeypatch):
+    from fakes import FakeUpdateModel
+
+    monkeypatch.setattr(cli.llm, "write_update", FakeUpdateModel())
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    monkeypatch.setattr(cli.editor, "edit_update", lambda draft, ref: Update("description", "mine", ""))
+    result = run("update", "BI-5", "x", input="e\ny\n")
+    assert result.exit_code == 0, result.output
+    assert shown.updates == [("description", "BI-5", "mine")]
 
 
 def test_new_edit_then_decline(backend, model, tmp_path, monkeypatch):
